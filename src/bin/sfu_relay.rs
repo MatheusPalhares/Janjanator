@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
@@ -9,7 +9,12 @@ use std::time::Duration;
 use crossbeam_channel::Sender;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tungstenite::protocol::WebSocket;
 use tungstenite::{accept, Message};
+
+pub const WIRE_TAG_CONTROL_JSON: u8 = 0x01;
+pub const WIRE_TAG_VIDEO_BINARY: u8 = 0x02;
+pub const WIRE_TAG_AUDIO_BINARY: u8 = 0x03;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParticipantInfo {
@@ -25,30 +30,7 @@ pub struct ParticipantInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncodedVideoPacket {
-    pub sender: String,
-    pub sequence: u64,
-    pub timestamp_ms: u64,
-    pub width: u32,
-    pub height: u32,
-    pub is_keyframe: bool,
-    pub hw_encoder_name: String,
-    pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncodedAudioPacket {
-    pub sender: String,
-    pub sequence: u64,
-    pub timestamp_ms: u64,
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub source_pid: u32,
-    pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SfuWireMessage {
+pub enum SfuControlMessage {
     JoinRoom {
         jwt_token: String,
         participant: ParticipantInfo,
@@ -67,36 +49,85 @@ pub enum SfuWireMessage {
     RequestKeyframe {
         target_host_identity: String,
     },
-    VideoTrackPacket(EncodedVideoPacket),
-    AudioTrackPacket(EncodedAudioPacket),
     Ping(u64),
     Pong(u64),
+}
+
+impl SfuControlMessage {
+    pub fn to_wire_bytes(&self) -> Option<Vec<u8>> {
+        let json = serde_json::to_vec(self).ok()?;
+        let mut out = Vec::with_capacity(1 + json.len());
+        out.push(WIRE_TAG_CONTROL_JSON);
+        out.extend_from_slice(&json);
+        Some(out)
+    }
+
+    pub fn from_wire_bytes(data: &[u8]) -> Option<Self> {
+        if data.is_empty() {
+            return None;
+        }
+        if data[0] == WIRE_TAG_CONTROL_JSON {
+            serde_json::from_slice(&data[1..]).ok()
+        } else {
+            serde_json::from_slice(data).ok()
+        }
+    }
+}
+
+fn peek_binary_packet_sender(data: &[u8]) -> Option<&str> {
+    if data.len() < 4 {
+        return None;
+    }
+    let tag = data[0];
+    if tag != WIRE_TAG_VIDEO_BINARY && tag != WIRE_TAG_AUDIO_BINARY {
+        return None;
+    }
+    let sender_len = u16::from_le_bytes([data[1], data[2]]) as usize;
+    if data.len() < 3 + sender_len {
+        return None;
+    }
+    std::str::from_utf8(&data[3..3 + sender_len]).ok()
 }
 
 struct ClientPeer {
     info: ParticipantInfo,
     watching: Option<String>,
-    tx: Sender<Vec<u8>>,
+    ctrl_tx: Sender<Vec<u8>>,
+    media_tx: Sender<Vec<u8>>,
 }
 
 fn broadcast_room_state(peers: &Arc<Mutex<HashMap<String, ClientPeer>>>) {
     let map = peers.lock();
     let participants: Vec<ParticipantInfo> = map.values().map(|p| p.info.clone()).collect();
-    if let Ok(bin) = serde_json::to_vec(&SfuWireMessage::RoomState { participants }) {
+    if let Some(bin) = (SfuControlMessage::RoomState { participants }).to_wire_bytes() {
         for peer in map.values() {
-            let _ = peer.tx.try_send(bin.clone());
+            let _ = peer.ctrl_tx.try_send(bin.clone());
         }
+    }
+}
+
+fn send_ws_resilient(socket: &mut WebSocket<TcpStream>, data: Vec<u8>) -> bool {
+    match socket.send(Message::Binary(data)) {
+        Ok(()) => true,
+        Err(tungstenite::Error::Io(ref err))
+            if err.kind() == ErrorKind::WouldBlock
+                || err.kind() == ErrorKind::TimedOut
+                || err.kind() == ErrorKind::Interrupted =>
+        {
+            let _ = socket.flush();
+            true
+        }
+        Err(_) => false,
     }
 }
 
 fn main() {
     println!("=============================================================");
-    println!("  ScreenShare Win11 Native - Docker SFU Relay & Hub Server   ");
-    println!("  - Media & Signaling Relay: 0.0.0.0:7890 (Max 10 Users)     ");
-    println!("  - HTTP Portal & Download : 0.0.0.0:7888                    ");
+    println!("  ScreenShare Win11 Native - Docker SFU Relay & Hub v2 (60fps)");
+    println!("  - Zero-Copy Binary Relay  : 0.0.0.0:7890 (Max 10 Users)     ");
+    println!("  - HTTP Portal & Download  : 0.0.0.0:7888                    ");
     println!("=============================================================");
 
-    // Copiar executável compilado para o volume /dist do Host se existir
     if let Ok(bytes) = fs::read("/app/screenshare-win11.exe") {
         let _ = fs::create_dir_all("/dist");
         if fs::write("/dist/screenshare-win11.exe", &bytes).is_ok() {
@@ -110,7 +141,6 @@ fn main() {
     let peers: Arc<Mutex<HashMap<String, ClientPeer>>> = Arc::new(Mutex::new(HashMap::new()));
     let peers_http = peers.clone();
 
-    // Thread HTTP Portal (:7888) para Healthcheck e Download direto do .exe pelos amigos
     thread::spawn(move || {
         if let Ok(http_listener) = TcpListener::bind("0.0.0.0:7888") {
             for stream in http_listener.incoming().flatten() {
@@ -122,7 +152,6 @@ fn main() {
         }
     });
 
-    // Servidor Principal WebSocket SFU (:7890)
     let listener = TcpListener::bind("0.0.0.0:7890").expect("Falha ao fazer bind em 0.0.0.0:7890");
 
     for stream in listener.incoming().flatten() {
@@ -130,134 +159,178 @@ fn main() {
         let peers_ref = peers.clone();
 
         thread::spawn(move || {
-            let Ok(mut ws) = accept(stream) else {
-                return;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                handle_peer_connection(stream, peers_ref);
+            }));
+        });
+    }
+}
+
+fn handle_peer_connection(
+    stream: TcpStream,
+    peers_ref: Arc<Mutex<HashMap<String, ClientPeer>>>,
+) {
+    let Ok(mut ws) = accept(stream) else {
+        return;
+    };
+    let _ = ws.get_ref().set_nonblocking(true);
+
+    let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+    let (media_tx, media_rx) = crossbeam_channel::bounded::<Vec<u8>>(48);
+    let mut my_id: Option<String> = None;
+
+    loop {
+        let mut active = false;
+
+        while let Ok(bin) = ctrl_rx.try_recv() {
+            active = true;
+            if !send_ws_resilient(&mut ws, bin) {
+                break;
+            }
+        }
+
+        let mut media_sent = 0;
+        while media_sent < 12 {
+            let Ok(bin) = media_rx.try_recv() else {
+                break;
             };
-            let _ = ws
-                .get_ref()
-                .set_read_timeout(Some(Duration::from_millis(5)));
+            active = true;
+            media_sent += 1;
+            if !send_ws_resilient(&mut ws, bin) {
+                break;
+            }
+        }
 
-            let (out_tx, out_rx) = crossbeam_channel::bounded::<Vec<u8>>(256);
-            let mut my_id: Option<String> = None;
-
-            loop {
-                while let Ok(bin) = out_rx.try_recv() {
-                    if ws.send(Message::Binary(bin)).is_err() {
-                        break;
+        for _ in 0..16 {
+            match ws.read() {
+                Ok(Message::Binary(data)) => {
+                    active = true;
+                    if data.is_empty() {
+                        continue;
                     }
-                }
-
-                match ws.read() {
-                    Ok(Message::Binary(data)) => {
-                        let Ok(msg) = serde_json::from_slice::<SfuWireMessage>(&data) else {
-                            continue;
-                        };
-                        match msg {
-                            SfuWireMessage::JoinRoom { participant, .. } => {
-                                let id = participant.identity.clone();
-                                println!(
-                                    "[JOIN] Usuário '{}' ({}) entrou na sala.",
-                                    participant.nickname, id
-                                );
-                                my_id = Some(id.clone());
-                                {
-                                    let mut map = peers_ref.lock();
-                                    if map.len() < 10 {
-                                        map.insert(
-                                            id,
-                                            ClientPeer {
-                                                info: participant,
-                                                watching: None,
-                                                tx: out_tx.clone(),
-                                            },
-                                        );
+                    match data[0] {
+                        WIRE_TAG_VIDEO_BINARY | WIRE_TAG_AUDIO_BINARY => {
+                            if let Some(sender_id) = peek_binary_packet_sender(&data) {
+                                let map = peers_ref.lock();
+                                for peer in map.values() {
+                                    if peer.watching.as_deref() == Some(sender_id) {
+                                        let _ = peer.media_tx.try_send(data.clone());
                                     }
                                 }
-                                broadcast_room_state(&peers_ref);
                             }
-                            SfuWireMessage::UpdateParticipant(info) => {
-                                {
-                                    let mut map = peers_ref.lock();
-                                    if let Some(peer) = map.get_mut(&info.identity) {
-                                        peer.info = info;
+                        }
+                        _ => {
+                            let Some(msg) = SfuControlMessage::from_wire_bytes(&data) else {
+                                continue;
+                            };
+                            match msg {
+                                SfuControlMessage::JoinRoom { participant, .. } => {
+                                    let id = participant.identity.clone();
+                                    println!(
+                                        "[JOIN] Usuário '{}' ({}) conectou.",
+                                        participant.nickname, id
+                                    );
+                                    my_id = Some(id.clone());
+                                    {
+                                        let mut map = peers_ref.lock();
+                                        let prev_watching =
+                                            map.get(&id).and_then(|p| p.watching.clone());
+                                        if map.len() < 10 || map.contains_key(&id) {
+                                            map.insert(
+                                                id,
+                                                ClientPeer {
+                                                    info: participant,
+                                                    watching: prev_watching,
+                                                    ctrl_tx: ctrl_tx.clone(),
+                                                    media_tx: media_tx.clone(),
+                                                },
+                                            );
+                                        }
+                                    }
+                                    broadcast_room_state(&peers_ref);
+                                }
+                                SfuControlMessage::UpdateParticipant(info) => {
+                                    {
+                                        let mut map = peers_ref.lock();
+                                        if let Some(peer) = map.get_mut(&info.identity) {
+                                            peer.info = info;
+                                        }
+                                    }
+                                    broadcast_room_state(&peers_ref);
+                                }
+                                SfuControlMessage::SubscribeStream {
+                                    viewer_identity,
+                                    target_host_identity,
+                                } => {
+                                    let mut host_tx = None;
+                                    {
+                                        let mut map = peers_ref.lock();
+                                        if let Some(viewer) = map.get_mut(&viewer_identity) {
+                                            viewer.watching = Some(target_host_identity.clone());
+                                        }
+                                        if let Some(host) = map.get(&target_host_identity) {
+                                            host_tx = Some(host.ctrl_tx.clone());
+                                        }
+                                    }
+                                    if let Some(tx) = host_tx {
+                                        if let Some(req) = (SfuControlMessage::RequestKeyframe {
+                                            target_host_identity,
+                                        })
+                                        .to_wire_bytes()
+                                        {
+                                            let _ = tx.try_send(req);
+                                        }
                                     }
                                 }
-                                broadcast_room_state(&peers_ref);
-                            }
-                            SfuWireMessage::SubscribeStream {
-                                viewer_identity,
-                                target_host_identity,
-                            } => {
-                                let mut host_tx = None;
-                                {
+                                SfuControlMessage::UnsubscribeStream { viewer_identity } => {
                                     let mut map = peers_ref.lock();
                                     if let Some(viewer) = map.get_mut(&viewer_identity) {
-                                        viewer.watching = Some(target_host_identity.clone());
-                                    }
-                                    if let Some(host) = map.get(&target_host_identity) {
-                                        host_tx = Some(host.tx.clone());
+                                        viewer.watching = None;
                                     }
                                 }
-                                if let Some(tx) = host_tx {
-                                    if let Ok(req) = serde_json::to_vec(
-                                        &SfuWireMessage::RequestKeyframe {
-                                            target_host_identity,
-                                        },
-                                    ) {
-                                        let _ = tx.try_send(req);
+                                SfuControlMessage::Ping(ts) => {
+                                    if let Some(pong) = SfuControlMessage::Pong(ts).to_wire_bytes()
+                                    {
+                                        let _ = ctrl_tx.try_send(pong);
                                     }
                                 }
+                                _ => {}
                             }
-                            SfuWireMessage::UnsubscribeStream { viewer_identity } => {
-                                let mut map = peers_ref.lock();
-                                if let Some(viewer) = map.get_mut(&viewer_identity) {
-                                    viewer.watching = None;
-                                }
-                            }
-                            SfuWireMessage::VideoTrackPacket(ref pkt) => {
-                                let sender_id = pkt.sender.clone();
-                                let map = peers_ref.lock();
-                                for peer in map.values() {
-                                    if peer.watching.as_deref() == Some(sender_id.as_str()) {
-                                        let _ = peer.tx.try_send(data.clone());
-                                    }
-                                }
-                            }
-                            SfuWireMessage::AudioTrackPacket(ref pkt) => {
-                                let sender_id = pkt.sender.clone();
-                                let map = peers_ref.lock();
-                                for peer in map.values() {
-                                    if peer.watching.as_deref() == Some(sender_id.as_str()) {
-                                        let _ = peer.tx.try_send(data.clone());
-                                    }
-                                }
-                            }
-                            SfuWireMessage::Ping(ts) => {
-                                if let Ok(pong) = serde_json::to_vec(&SfuWireMessage::Pong(ts)) {
-                                    let _ = out_tx.try_send(pong);
-                                }
-                            }
-                            _ => {}
                         }
                     }
-                    Ok(Message::Close(_)) => break,
-                    Err(tungstenite::Error::Io(ref e))
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(_) => break,
-                    _ => {}
                 }
+                Ok(Message::Close(_)) => {
+                    if let Some(id) = my_id.take() {
+                        println!("[LEAVE] Usuário '{}' desconectou.", id);
+                        peers_ref.lock().remove(&id);
+                        broadcast_room_state(&peers_ref);
+                    }
+                    return;
+                }
+                Err(tungstenite::Error::Io(ref e))
+                    if e.kind() == ErrorKind::WouldBlock
+                        || e.kind() == ErrorKind::TimedOut
+                        || e.kind() == ErrorKind::Interrupted =>
+                {
+                    break;
+                }
+                Err(_) => {
+                    if let Some(id) = my_id.take() {
+                        println!("[LEAVE] Usuário '{}' desconectou.", id);
+                        peers_ref.lock().remove(&id);
+                        broadcast_room_state(&peers_ref);
+                    }
+                    return;
+                }
+                _ => {}
             }
+        }
 
-            if let Some(id) = my_id {
-                println!("[LEAVE] Usuário '{}' saiu da sala.", id);
-                peers_ref.lock().remove(&id);
-                broadcast_room_state(&peers_ref);
-            }
-        });
+        let _ = ws.flush();
+
+        if !active {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -311,7 +384,7 @@ code {{ background:#1f2937; padding:3px 6px; border-radius:4px; color:#93c5fd; }
 <div class="card">
   <h1>⚡ ScreenShare Win11 Native</h1>
   <div class="badge">● Servidor Docker SFU Online ({}/10 usuários na sala)</div>
-  <p>Servidor LiveKit SFU (<code>:7880</code>) + Media Relay (<code>:7890</code>) operacional.</p>
+  <p>Servidor LiveKit SFU (<code>:7880</code>) + Binary Media Relay 60fps (<code>:7890</code>) operacional.</p>
   <p>Baixe o executável portátil para Windows 11 abaixo ou pela aba <b>Releases</b> do GitHub:</p>
   <a class="btn" href="/download/screenshare-win11.exe">⬇ Baixar screenshare-win11.exe (Portátil)</a>
 </div>
@@ -327,4 +400,3 @@ code {{ background:#1f2937; padding:3px 6px; border-radius:4px; color:#93c5fd; }
     );
     let _ = stream.write_all(resp.as_bytes());
 }
-

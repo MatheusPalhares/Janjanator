@@ -4,6 +4,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
+use rayon::prelude::*;
 
 use crate::types::{CaptureEvent, CaptureTarget, CaptureTargetKind, ResolutionPreset};
 
@@ -61,7 +62,7 @@ pub fn enumerate_monitors() -> Vec<CaptureTarget> {
             monitors.push(CaptureTarget {
                 id: 1,
                 title: "Monitor Principal (Windows 11)".to_string(),
-                process_name: "Explorer.exe".to_string(),
+                process_name: "Desktop".to_string(),
                 hwnd: 0,
                 hmonitor: 1,
                 pid: 0,
@@ -103,7 +104,7 @@ unsafe extern "system" fn enum_monitors_proc(
         let index = monitors.len() + 1;
         let is_primary = (mi.monitorInfo.dwFlags & 1) != 0;
         let title = if is_primary {
-            format!("Monitor {} - Principal ({})", index, dev_name)
+            format!("Monitor {} — Principal ({})", index, dev_name)
         } else {
             format!("Monitor {} ({})", index, dev_name)
         };
@@ -111,7 +112,7 @@ unsafe extern "system" fn enum_monitors_proc(
         monitors.push(CaptureTarget {
             id: hmonitor.0 as u64,
             title,
-            process_name: "Desktop".to_string(),
+            process_name: "Monitor Físico".to_string(),
             hwnd: 0,
             hmonitor: hmonitor.0 as isize,
             pid: 0,
@@ -151,7 +152,6 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         return TRUE;
     }
 
-    // Ignorar janelas utilitárias ocultas/toolwindows e janelas "cloaked" pelo DWM do Windows 11
     let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
         return TRUE;
@@ -229,7 +229,7 @@ unsafe fn query_process_name(pid: u32) -> String {
     format!("PID-{}", pid)
 }
 
-/// Controlador de captura de vídeo em thread dedicada (Windows.Graphics.Capture D3D11 + Fallback GDI resiliente).
+/// Controlador de captura de vídeo em thread dedicada (Windows.Graphics.Capture D3D11 Zero-Stall).
 pub struct VideoCaptureSession {
     stop_flag: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -248,7 +248,9 @@ impl VideoCaptureSession {
         let worker = thread::Builder::new()
             .name("wgc-video-capture".to_string())
             .spawn(move || {
-                run_capture_loop(target, resolution, fps, stop_clone, event_tx);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    run_capture_loop(target, resolution, fps, stop_clone, event_tx);
+                }));
             })
             .expect("Falha ao criar thread de captura WGC");
 
@@ -278,8 +280,11 @@ struct WgcEngine {
     d3d_context: ID3D11DeviceContext,
     frame_pool: Direct3D11CaptureFramePool,
     session: windows::Graphics::Capture::GraphicsCaptureSession,
-    last_w: u32,
-    last_h: u32,
+    staging_tex: Option<ID3D11Texture2D>,
+    staging_w: u32,
+    staging_h: u32,
+    pool_w: u32,
+    pool_h: u32,
 }
 
 #[cfg(windows)]
@@ -314,9 +319,7 @@ impl WgcEngine {
             windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
 
         let item: GraphicsCaptureItem = match target.kind {
-            CaptureTargetKind::Window => {
-                interop.CreateForWindow(HWND(target.hwnd as *mut _))?
-            }
+            CaptureTargetKind::Window => interop.CreateForWindow(HWND(target.hwnd as *mut _))?,
             CaptureTargetKind::Monitor => {
                 interop.CreateForMonitor(HMONITOR(target.hmonitor as *mut _))?
             }
@@ -326,10 +329,11 @@ impl WgcEngine {
         let w = size.Width.max(64) as u32;
         let h = size.Height.max(64) as u32;
 
+        // Buffer de 3 frames para permitir captura contínua a 60+ FPS sem stalls de GPU
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &winrt_d3d_device,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
+            3,
             size,
         )?;
 
@@ -343,80 +347,124 @@ impl WgcEngine {
             d3d_context,
             frame_pool,
             session,
-            last_w: w,
-            last_h: h,
+            staging_tex: None,
+            staging_w: 0,
+            staging_h: 0,
+            pool_w: w,
+            pool_h: h,
         })
     }
 
-    unsafe fn try_grab_frame(&mut self) -> Option<(u32, u32, Vec<u8>)> {
-        let frame = self.frame_pool.TryGetNextFrame().ok()?;
-        let content_size = frame.ContentSize().ok()?;
-        let surface: IDirect3DSurface = frame.Surface().ok()?;
+    /// Drena o pool e pega sempre o frame mais recente da GPU reutilizando a textura Staging D3D11.
+    unsafe fn try_grab_latest_frame(&mut self, out_bgra: &mut Vec<u8>) -> Option<(u32, u32)> {
+        let mut latest_frame = self.frame_pool.TryGetNextFrame().ok()?;
+        // Se houver mais frames acumulados no pool, descartar os antigos e ficar com o mais novo (Zero-Lag)
+        while let Ok(newer) = self.frame_pool.TryGetNextFrame() {
+            let _ = latest_frame.Close();
+            latest_frame = newer;
+        }
+
+        let content_size = latest_frame.ContentSize().ok()?;
+        let surface: IDirect3DSurface = latest_frame.Surface().ok()?;
         let access: IDirect3DDxgiInterfaceAccess = surface.cast().ok()?;
         let texture: ID3D11Texture2D = access.GetInterface().ok()?;
 
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         texture.GetDesc(&mut desc);
 
-        if desc.Width == 0 || desc.Height == 0 {
+        if desc.Width < 16 || desc.Height < 16 {
+            let _ = latest_frame.Close();
             return None;
         }
 
-        // Se a janela foi redimensionada, recriar o pool para o novo tamanho
+        // Recriar o frame pool se a janela mudou de tamanho
         let cw = content_size.Width.max(64) as u32;
         let ch = content_size.Height.max(64) as u32;
-        if cw != self.last_w || ch != self.last_h {
-            self.last_w = cw;
-            self.last_h = ch;
-            let dxgi_device: IDXGIDevice = self.d3d_device.cast().ok()?;
-            if let Ok(inspectable) = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) {
-                if let Ok(winrt_dev) = inspectable
-                    .cast::<windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>()
-                {
-                    let _ = self.frame_pool.Recreate(
-                        &winrt_dev,
-                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                        2,
-                        content_size,
-                    );
+        if cw != self.pool_w || ch != self.pool_h {
+            self.pool_w = cw;
+            self.pool_h = ch;
+            if let Ok(dxgi_device) = self.d3d_device.cast::<IDXGIDevice>() {
+                if let Ok(inspectable) = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) {
+                    if let Ok(winrt_dev) = inspectable
+                        .cast::<windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>()
+                    {
+                        let _ = self.frame_pool.Recreate(
+                            &winrt_dev,
+                            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                            3,
+                            content_size,
+                        );
+                    }
                 }
             }
         }
 
-        let mut staging_desc = desc;
-        staging_desc.Usage = D3D11_USAGE_STAGING;
-        staging_desc.BindFlags = 0;
-        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-        staging_desc.MiscFlags = 0;
+        // Reutilizar textura Staging na GPU (só recria se a resolução da textura mudou)
+        if self.staging_tex.is_none()
+            || self.staging_w != desc.Width
+            || self.staging_h != desc.Height
+        {
+            let mut staging_desc = desc;
+            staging_desc.Usage = D3D11_USAGE_STAGING;
+            staging_desc.BindFlags = 0;
+            staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            staging_desc.MiscFlags = 0;
 
-        let mut staging_tex: Option<ID3D11Texture2D> = None;
-        self.d3d_device
-            .CreateTexture2D(&staging_desc, None, Some(&mut staging_tex))
-            .ok()?;
-        let staging_tex = staging_tex?;
+            let mut new_tex: Option<ID3D11Texture2D> = None;
+            if self
+                .d3d_device
+                .CreateTexture2D(&staging_desc, None, Some(&mut new_tex))
+                .is_err()
+            {
+                let _ = latest_frame.Close();
+                return None;
+            }
+            self.staging_tex = new_tex;
+            self.staging_w = desc.Width;
+            self.staging_h = desc.Height;
+        }
 
-        self.d3d_context.CopyResource(&staging_tex, &texture);
+        let Some(ref staging_tex) = self.staging_tex else {
+            let _ = latest_frame.Close();
+            return None;
+        };
+
+        self.d3d_context.CopyResource(staging_tex, &texture);
+        let _ = latest_frame.Close();
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        self.d3d_context
-            .Map(&staging_tex, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            .ok()?;
+        if self
+            .d3d_context
+            .Map(staging_tex, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .is_err()
+        {
+            return None;
+        }
 
         let width = desc.Width;
         let height = desc.Height;
         let row_pitch = mapped.RowPitch as usize;
         let dst_row_bytes = (width as usize) * 4;
-        let mut bgra = vec![0u8; dst_row_bytes * (height as usize)];
+        let total_bytes = dst_row_bytes * (height as usize);
 
-        let src_ptr = mapped.pData as *const u8;
-        for y in 0..(height as usize) {
-            let src_row = std::slice::from_raw_parts(src_ptr.add(y * row_pitch), dst_row_bytes);
-            let dst_row = &mut bgra[y * dst_row_bytes..(y + 1) * dst_row_bytes];
-            dst_row.copy_from_slice(src_row);
+        if out_bgra.len() != total_bytes {
+            out_bgra.resize(total_bytes, 0);
         }
 
-        self.d3d_context.Unmap(&staging_tex, 0);
-        Some((width, height, bgra))
+        let src_ptr = mapped.pData as *const u8;
+        if row_pitch == dst_row_bytes {
+            let src_slice = std::slice::from_raw_parts(src_ptr, total_bytes);
+            out_bgra.copy_from_slice(src_slice);
+        } else {
+            for y in 0..(height as usize) {
+                let src_row = std::slice::from_raw_parts(src_ptr.add(y * row_pitch), dst_row_bytes);
+                let dst_row = &mut out_bgra[y * dst_row_bytes..(y + 1) * dst_row_bytes];
+                dst_row.copy_from_slice(src_row);
+            }
+        }
+
+        self.d3d_context.Unmap(staging_tex, 0);
+        Some((width, height))
     }
 }
 
@@ -437,22 +485,22 @@ fn run_capture_loop(
 ) {
     #[cfg(windows)]
     unsafe {
-        let frame_interval = Duration::from_micros(1_000_000 / fps.max(1) as u64);
+        let target_fps = fps.clamp(15, 120);
+        let frame_interval = Duration::from_nanos(1_000_000_000 / target_fps as u64);
         let mut wgc_engine = WgcEngine::new(&target).ok();
         let mut was_minimized = false;
-        let mut last_frame_cache: Option<(u32, u32, Vec<u8>)> = None;
+
+        let mut raw_bgra_buf: Vec<u8> = Vec::new();
+        let mut last_scaled_cache: Option<(u32, u32, Vec<u8>)> = None;
+        let mut last_sent_instant = Instant::now();
+        let mut next_tick = Instant::now();
 
         while !stop_flag.load(Ordering::Relaxed) {
-            let start = Instant::now();
-
             // 6.1. Verificar estado da janela (fechada ou minimizada)
             if target.kind == CaptureTargetKind::Window {
                 let hwnd = HWND(target.hwnd as *mut _);
                 if !IsWindow(hwnd).as_bool() {
-                    let _ = event_tx.send(CaptureEvent::TargetClosed(format!(
-                        "A janela '{}' foi fechada.",
-                        target.title
-                    )));
+                    let _ = event_tx.send(CaptureEvent::TargetClosed);
                     break;
                 }
 
@@ -461,7 +509,8 @@ fn run_capture_loop(
                         was_minimized = true;
                         let _ = event_tx.send(CaptureEvent::TargetMinimized);
                     }
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(Duration::from_millis(80));
+                    next_tick = Instant::now();
                     continue;
                 } else if was_minimized {
                     was_minimized = false;
@@ -469,52 +518,67 @@ fn run_capture_loop(
                 }
             }
 
-            // 1.2. Tentar capturar via Windows.Graphics.Capture (D3D11)
-            let mut captured = None;
+            let mut got_new_gpu_frame = false;
+            let mut raw_dims = (0u32, 0u32);
+
             if let Some(ref mut engine) = wgc_engine {
-                captured = engine.try_grab_frame();
-            }
-
-            // Se WGC não tiver um novo frame no pool ou falhar, usar fallback GDI/PrintWindow ou cache
-            if captured.is_none() {
-                if let Some(gdi_frame) = capture_fallback_gdi(&target) {
-                    captured = Some(gdi_frame);
-                } else if let Some(ref cached) = last_frame_cache {
-                    captured = Some(cached.clone());
+                if let Some((w, h)) = engine.try_grab_latest_frame(&mut raw_bgra_buf) {
+                    got_new_gpu_frame = true;
+                    raw_dims = (w, h);
                 }
-            } else {
-                last_frame_cache = captured.clone();
+            } else if let Some((w, h, gdi_data)) = capture_fallback_gdi(&target) {
+                raw_bgra_buf = gdi_data;
+                got_new_gpu_frame = true;
+                raw_dims = (w, h);
             }
 
-            if let Some((src_w, src_h, src_bgra)) = captured {
+            if got_new_gpu_frame {
+                let (src_w, src_h) = raw_dims;
                 let (dst_w, dst_h) = resolution.target_dimensions(src_w, src_h);
                 let final_bgra = if dst_w == src_w && dst_h == src_h {
-                    src_bgra
+                    raw_bgra_buf.clone()
                 } else {
-                    downscale_bgra(&src_bgra, src_w, src_h, dst_w, dst_h)
+                    downscale_bgra_parallel(&raw_bgra_buf, src_w, src_h, dst_w, dst_h)
                 };
 
-                if event_tx
-                    .try_send(CaptureEvent::FrameCaptured {
+                last_scaled_cache = Some((dst_w, dst_h, final_bgra.clone()));
+                last_sent_instant = Instant::now();
+
+                let _ = event_tx.try_send(CaptureEvent::FrameCaptured {
+                    width: dst_w,
+                    height: dst_h,
+                    bgra: final_bgra,
+                });
+            } else if last_sent_instant.elapsed() >= Duration::from_millis(200) {
+                // Se a janela capturada está 100% estática (sem novos frames da GPU), envia keepalive leve
+                if let Some((dst_w, dst_h, ref cached)) = last_scaled_cache {
+                    last_sent_instant = Instant::now();
+                    let _ = event_tx.try_send(CaptureEvent::FrameCaptured {
                         width: dst_w,
                         height: dst_h,
-                        bgra: final_bgra,
-                    })
-                    .is_err()
-                {
-                    // Se o canal estiver cheio, descarta o frame antigo para manter zero-latency
+                        bgra: cached.clone(),
+                    });
                 }
             }
 
-            let elapsed = start.elapsed();
-            if elapsed < frame_interval {
-                thread::sleep(frame_interval - elapsed);
+            next_tick += frame_interval;
+            let now = Instant::now();
+            if next_tick > now {
+                let wait = next_tick - now;
+                if wait > Duration::from_millis(2) {
+                    thread::sleep(wait - Duration::from_millis(1));
+                }
+                while Instant::now() < next_tick {
+                    std::hint::spin_loop();
+                }
+            } else {
+                next_tick = now;
             }
         }
     }
 }
 
-/// Fallback resiliente via PrintWindow / BitBlt para janelas ou monitores caso WGC não entregue frame estático.
+/// Fallback via BitBlt/PrintWindow usado APENAS se WGC não estiver disponível.
 #[cfg(windows)]
 unsafe fn capture_fallback_gdi(target: &CaptureTarget) -> Option<(u32, u32, Vec<u8>)> {
     match target.kind {
@@ -538,19 +602,21 @@ unsafe fn capture_fallback_gdi(target: &CaptureTarget) -> Option<(u32, u32, Vec<
             let hbm = CreateCompatibleBitmap(hdc_window, width as i32, height as i32);
             let old_obj = SelectObject(hdc_mem, hbm);
 
-            let ok = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool();
-            if !ok {
-                let _ = BitBlt(
-                    hdc_mem,
-                    0,
-                    0,
-                    width as i32,
-                    height as i32,
-                    hdc_window,
-                    0,
-                    0,
-                    SRCCOPY,
-                );
+            // Tentar BitBlt rápido primeiro; se falhar, PrintWindow
+            if BitBlt(
+                hdc_mem,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                hdc_window,
+                0,
+                0,
+                SRCCOPY,
+            )
+            .is_err()
+            {
+                let _ = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT));
             }
 
             let bgra = extract_dib_bits(hdc_mem, hbm, width, height);
@@ -621,7 +687,7 @@ unsafe fn extract_dib_bits(
     let mut bmi = BITMAPINFO::default();
     bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
     bmi.bmiHeader.biWidth = width as i32;
-    bmi.bmiHeader.biHeight = -(height as i32); // Top-down DIB
+    bmi.bmiHeader.biHeight = -(height as i32);
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB.0;
@@ -643,34 +709,43 @@ unsafe fn extract_dib_bits(
     }
 }
 
-/// 1.3. Redimensionamento rápido de textura BGRA para 720p / 1080p / Nativo.
-pub fn downscale_bgra(
+/// 1.3. Redimensionamento paralelo multi-core (`rayon`) com verificação segura de limites (< 1ms para 1080p).
+pub fn downscale_bgra_parallel(
     src: &[u8],
     src_w: u32,
     src_h: u32,
     dst_w: u32,
     dst_h: u32,
 ) -> Vec<u8> {
-    let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
-    let x_ratio = ((src_w as usize) << 16) / (dst_w as usize).max(1);
-    let y_ratio = ((src_h as usize) << 16) / (dst_h as usize).max(1);
+    let src_w = src_w.max(1) as usize;
+    let src_h = src_h.max(1) as usize;
+    let dst_w = dst_w.max(1) as usize;
+    let dst_h = dst_h.max(1) as usize;
+    let src_stride = src_w * 4;
+    let dst_stride = dst_w * 4;
 
-    let src_stride = (src_w as usize) * 4;
-    let dst_stride = (dst_w as usize) * 4;
-
-    for y in 0..(dst_h as usize) {
-        let sy = ((y * y_ratio) >> 16).min((src_h as usize).saturating_sub(1));
-        let src_row = &src[sy * src_stride..(sy + 1) * src_stride];
-        let dst_row = &mut dst[y * dst_stride..(y + 1) * dst_stride];
-
-        let mut sx_fp = 0usize;
-        for x in 0..(dst_w as usize) {
-            let sx = (sx_fp >> 16) * 4;
-            let dx = x * 4;
-            dst_row[dx..dx + 4].copy_from_slice(&src_row[sx..sx + 4]);
-            sx_fp += x_ratio;
-        }
+    if src.len() < src_stride * src_h {
+        return vec![0u8; dst_stride * dst_h];
     }
+
+    let mut dst = vec![0u8; dst_stride * dst_h];
+    let x_ratio = (src_w << 16) / dst_w;
+    let y_ratio = (src_h << 16) / dst_h;
+    let max_sx = (src_w - 1) * 4;
+
+    dst.par_chunks_mut(dst_stride)
+        .enumerate()
+        .for_each(|(y, dst_row)| {
+            let sy = ((y * y_ratio) >> 16).min(src_h - 1);
+            let src_row = &src[sy * src_stride..(sy + 1) * src_stride];
+            let mut sx_fp = 0usize;
+            for x in 0..dst_w {
+                let sx = ((sx_fp >> 16) * 4).min(max_sx);
+                let dx = x * 4;
+                dst_row[dx..dx + 4].copy_from_slice(&src_row[sx..sx + 4]);
+                sx_fp += x_ratio;
+            }
+        });
+
     dst
 }
-

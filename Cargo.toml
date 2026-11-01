@@ -27,9 +27,10 @@ lz4_flex = "0.11"
 jpeg-decoder = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
-# Concorrência, Canais e Utilitários de Tempo/Logs
+# Concorrência, Paralelismo SIMD/Multi-core, Canais e Utilitários
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
+rayon = "1.10"
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1.0"
@@ -82,4 +83,3 @@ lto = true
 codegen-units = 1
 opt-level = 3
 strip = true
-panic = "abort"

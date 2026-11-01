@@ -45,10 +45,12 @@ impl ProcessAudioCaptureSession {
         let worker = thread::Builder::new()
             .name(format!("wasapi-pid-{}-loopback", target_pid))
             .spawn(move || {
-                #[cfg(windows)]
-                unsafe {
-                    run_process_loopback_capture(target_pid, stop_clone, pcm_tx);
-                }
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    #[cfg(windows)]
+                    unsafe {
+                        run_process_loopback_capture(target_pid, stop_clone, pcm_tx);
+                    }
+                }));
             })
             .expect("Falha ao iniciar thread WASAPI Process Loopback");
 
@@ -368,10 +370,12 @@ impl AudioPlaybackEngine {
         let worker = thread::Builder::new()
             .name("wasapi-audio-player".to_string())
             .spawn(move || {
-                #[cfg(windows)]
-                unsafe {
-                    run_audio_playback_loop(pcm_rx, stop_clone, vol_clone);
-                }
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    #[cfg(windows)]
+                    unsafe {
+                        run_audio_playback_loop(pcm_rx, stop_clone, vol_clone);
+                    }
+                }));
             })
             .expect("Falha ao criar thread de reprodução WASAPI");
 

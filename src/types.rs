@@ -1,3 +1,5 @@
+use std::io::{Cursor, Read, Write};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,9 +12,9 @@ pub enum ResolutionPreset {
 impl ResolutionPreset {
     pub fn label(&self) -> &'static str {
         match self {
-            ResolutionPreset::Res720p => "720p (1280x720 - HD)",
-            ResolutionPreset::Res1080p => "1080p (1920x1080 - Full HD)",
-            ResolutionPreset::Native => "Nativo (Resolução da Fonte)",
+            ResolutionPreset::Res720p => "720p HD (1280×720)",
+            ResolutionPreset::Res1080p => "1080p Full HD (1920×1080)",
+            ResolutionPreset::Native => "Nativo (Resolução Original)",
         }
     }
 
@@ -28,10 +30,7 @@ impl ResolutionPreset {
         let src_w = src_w.max(64);
         let src_h = src_h.max(64);
         match self {
-            ResolutionPreset::Native => {
-                // Ensure even dimensions for hardware H.264 encoders
-                ((src_w & !1).max(64), (src_h & !1).max(64))
-            }
+            ResolutionPreset::Native => ((src_w & !1).max(64), (src_h & !1).max(64)),
             ResolutionPreset::Res720p => scale_preserving_aspect(src_w, src_h, 1280, 720),
             ResolutionPreset::Res1080p => scale_preserving_aspect(src_w, src_h, 1920, 1080),
         }
@@ -66,14 +65,15 @@ impl FpsPreset {
 
     pub fn label(&self) -> &'static str {
         match self {
-            FpsPreset::Fps30 => "30 FPS",
-            FpsPreset::Fps60 => "60 FPS (Fluido)",
+            FpsPreset::Fps30 => "30 FPS (Estável)",
+            FpsPreset::Fps60 => "60 FPS (Ultra Fluido)",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BitratePreset {
+    AutoAdaptive,
     Medium6Mbps,
     High12Mbps,
     Ultra25Mbps,
@@ -82,6 +82,7 @@ pub enum BitratePreset {
 impl BitratePreset {
     pub fn bps(&self) -> u32 {
         match self {
+            BitratePreset::AutoAdaptive => 20_000_000,
             BitratePreset::Medium6Mbps => 6_000_000,
             BitratePreset::High12Mbps => 12_000_000,
             BitratePreset::Ultra25Mbps => 25_000_000,
@@ -92,19 +93,30 @@ impl BitratePreset {
         self.bps() / 1000
     }
 
-    pub fn jpeg_quality(&self) -> u8 {
+    pub fn initial_quality(&self) -> u8 {
         match self {
-            BitratePreset::Medium6Mbps => 72,
-            BitratePreset::High12Mbps => 85,
-            BitratePreset::Ultra25Mbps => 94,
+            BitratePreset::AutoAdaptive => 84,
+            BitratePreset::Medium6Mbps => 68,
+            BitratePreset::High12Mbps => 80,
+            BitratePreset::Ultra25Mbps => 90,
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
+            BitratePreset::AutoAdaptive => "⚡ Auto (Máximo Estável)",
             BitratePreset::Medium6Mbps => "Médio (6 Mbps)",
             BitratePreset::High12Mbps => "Alto (12 Mbps)",
             BitratePreset::Ultra25Mbps => "Ultra (25 Mbps)",
+        }
+    }
+
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            BitratePreset::AutoAdaptive => "Auto",
+            BitratePreset::Medium6Mbps => "6 Mbps",
+            BitratePreset::High12Mbps => "12 Mbps",
+            BitratePreset::Ultra25Mbps => "25 Mbps",
         }
     }
 }
@@ -132,25 +144,16 @@ impl CaptureTarget {
     pub fn display_label(&self) -> String {
         match self.kind {
             CaptureTargetKind::Monitor => {
-                format!("🖥 {} ({}x{})", self.title, self.width, self.height)
+                format!("🖥 {} ({}×{})", self.title, self.width, self.height)
             }
             CaptureTargetKind::Window => {
                 format!(
-                    "🪟 {} [PID: {}] ({}x{})",
-                    self.title, self.pid, self.width, self.height
+                    "🪟 {} [{} | PID {}] ({}×{})",
+                    self.title, self.process_name, self.pid, self.width, self.height
                 )
             }
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamConfig {
-    pub target: CaptureTarget,
-    pub share_window_audio: bool,
-    pub resolution: ResolutionPreset,
-    pub fps: FpsPreset,
-    pub bitrate: BitratePreset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,7 +169,11 @@ pub struct ParticipantInfo {
     pub audio_pid: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub const WIRE_TAG_CONTROL_JSON: u8 = 0x01;
+pub const WIRE_TAG_VIDEO_BINARY: u8 = 0x02;
+pub const WIRE_TAG_AUDIO_BINARY: u8 = 0x03;
+
+#[derive(Debug, Clone)]
 pub struct EncodedVideoPacket {
     pub sender: String,
     pub sequence: u64,
@@ -178,7 +185,70 @@ pub struct EncodedVideoPacket {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl EncodedVideoPacket {
+    /// Serialização binária ultra-rápida (Zero-Copy overhead, sem JSON).
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let sender_bytes = self.sender.as_bytes();
+        let enc_bytes = self.hw_encoder_name.as_bytes();
+        let mut buf = Vec::with_capacity(32 + sender_bytes.len() + enc_bytes.len() + self.payload.len());
+
+        let _ = buf.write_u8(WIRE_TAG_VIDEO_BINARY);
+        let _ = buf.write_u16::<LittleEndian>(sender_bytes.len() as u16);
+        let _ = buf.write_all(sender_bytes);
+        let _ = buf.write_u64::<LittleEndian>(self.sequence);
+        let _ = buf.write_u64::<LittleEndian>(self.timestamp_ms);
+        let _ = buf.write_u32::<LittleEndian>(self.width);
+        let _ = buf.write_u32::<LittleEndian>(self.height);
+        let _ = buf.write_u8(u8::from(self.is_keyframe));
+        let _ = buf.write_u16::<LittleEndian>(enc_bytes.len() as u16);
+        let _ = buf.write_all(enc_bytes);
+        let _ = buf.write_u32::<LittleEndian>(self.payload.len() as u32);
+        let _ = buf.write_all(&self.payload);
+        buf
+    }
+
+    pub fn from_wire_bytes(data: &[u8]) -> Option<Self> {
+        if data.first().copied()? != WIRE_TAG_VIDEO_BINARY {
+            return None;
+        }
+        let mut cur = Cursor::new(&data[1..]);
+        let sender_len = cur.read_u16::<LittleEndian>().ok()? as usize;
+        let mut sender_buf = vec![0u8; sender_len];
+        cur.read_exact(&mut sender_buf).ok()?;
+        let sender = String::from_utf8(sender_buf).ok()?;
+
+        let sequence = cur.read_u64::<LittleEndian>().ok()?;
+        let timestamp_ms = cur.read_u64::<LittleEndian>().ok()?;
+        let width = cur.read_u32::<LittleEndian>().ok()?;
+        let height = cur.read_u32::<LittleEndian>().ok()?;
+        let is_keyframe = cur.read_u8().ok()? != 0;
+
+        let enc_len = cur.read_u16::<LittleEndian>().ok()? as usize;
+        let mut enc_buf = vec![0u8; enc_len];
+        cur.read_exact(&mut enc_buf).ok()?;
+        let hw_encoder_name = String::from_utf8(enc_buf).ok()?;
+
+        let payload_len = cur.read_u32::<LittleEndian>().ok()? as usize;
+        let pos = cur.position() as usize + 1;
+        if pos + payload_len > data.len() {
+            return None;
+        }
+        let payload = data[pos..pos + payload_len].to_vec();
+
+        Some(Self {
+            sender,
+            sequence,
+            timestamp_ms,
+            width,
+            height,
+            is_keyframe,
+            hw_encoder_name,
+            payload,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct EncodedAudioPacket {
     pub sender: String,
     pub sequence: u64,
@@ -189,10 +259,61 @@ pub struct EncodedAudioPacket {
     pub payload: Vec<u8>,
 }
 
+impl EncodedAudioPacket {
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let sender_bytes = self.sender.as_bytes();
+        let mut buf = Vec::with_capacity(32 + sender_bytes.len() + self.payload.len());
+
+        let _ = buf.write_u8(WIRE_TAG_AUDIO_BINARY);
+        let _ = buf.write_u16::<LittleEndian>(sender_bytes.len() as u16);
+        let _ = buf.write_all(sender_bytes);
+        let _ = buf.write_u64::<LittleEndian>(self.sequence);
+        let _ = buf.write_u64::<LittleEndian>(self.timestamp_ms);
+        let _ = buf.write_u32::<LittleEndian>(self.sample_rate);
+        let _ = buf.write_u16::<LittleEndian>(self.channels);
+        let _ = buf.write_u32::<LittleEndian>(self.source_pid);
+        let _ = buf.write_u32::<LittleEndian>(self.payload.len() as u32);
+        let _ = buf.write_all(&self.payload);
+        buf
+    }
+
+    pub fn from_wire_bytes(data: &[u8]) -> Option<Self> {
+        if data.first().copied()? != WIRE_TAG_AUDIO_BINARY {
+            return None;
+        }
+        let mut cur = Cursor::new(&data[1..]);
+        let sender_len = cur.read_u16::<LittleEndian>().ok()? as usize;
+        let mut sender_buf = vec![0u8; sender_len];
+        cur.read_exact(&mut sender_buf).ok()?;
+        let sender = String::from_utf8(sender_buf).ok()?;
+
+        let sequence = cur.read_u64::<LittleEndian>().ok()?;
+        let timestamp_ms = cur.read_u64::<LittleEndian>().ok()?;
+        let sample_rate = cur.read_u32::<LittleEndian>().ok()?;
+        let channels = cur.read_u16::<LittleEndian>().ok()?;
+        let source_pid = cur.read_u32::<LittleEndian>().ok()?;
+
+        let payload_len = cur.read_u32::<LittleEndian>().ok()? as usize;
+        let pos = cur.position() as usize + 1;
+        if pos + payload_len > data.len() {
+            return None;
+        }
+        let payload = data[pos..pos + payload_len].to_vec();
+
+        Some(Self {
+            sender,
+            sequence,
+            timestamp_ms,
+            sample_rate,
+            channels,
+            source_pid,
+            payload,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodedVideoFrame {
-    pub sender: String,
-    pub sequence: u64,
     pub width: u32,
     pub height: u32,
     pub hw_encoder_name: String,
@@ -208,6 +329,5 @@ pub enum CaptureEvent {
     },
     TargetMinimized,
     TargetRestored,
-    TargetClosed(String),
+    TargetClosed,
 }
-

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,11 +14,12 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tungstenite::protocol::WebSocket;
-use tungstenite::{accept, connect, Message};
+use tungstenite::{accept, Message};
 
-use crate::codec::{decode_audio_packet, decode_video_packet};
+use crate::codec::{decode_audio_packet, VideoStreamDecoder};
 use crate::types::{
     DecodedVideoFrame, EncodedAudioPacket, EncodedVideoPacket, ParticipantInfo,
+    WIRE_TAG_AUDIO_BINARY, WIRE_TAG_CONTROL_JSON, WIRE_TAG_VIDEO_BINARY,
 };
 
 pub const LIVEKIT_API_KEY: &str = "APIScreenSharePrivateKey";
@@ -63,7 +65,7 @@ pub fn generate_livekit_jwt(identity: &str, nickname: &str, room: &str) -> Strin
         name: nickname.to_string(),
         iat: now,
         nbf: now.saturating_sub(10),
-        exp: now + 86_400, // válido por 24 horas
+        exp: now + 86_400,
         video: LiveKitVideoGrant {
             room_join: true,
             room: room.to_string(),
@@ -86,9 +88,10 @@ pub fn generate_livekit_jwt(identity: &str, nickname: &str, room: &str) -> Strin
     format!("{}.{}", signing_input, sig_b64)
 }
 
-/// Protocolo de sinalização e transporte de mídia da Sala SFU (até 10 usuários).
+/// Mensagens de Controle da Sala (serializadas com prefixo `WIRE_TAG_CONTROL_JSON = 0x01`).
+/// Os pacotes de Vídeo (`0x02`) e Áudio (`0x03`) trafegam em binário puro sem tocar em JSON!
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SfuWireMessage {
+pub enum SfuControlMessage {
     JoinRoom {
         jwt_token: String,
         participant: ParticipantInfo,
@@ -107,10 +110,45 @@ pub enum SfuWireMessage {
     RequestKeyframe {
         target_host_identity: String,
     },
-    VideoTrackPacket(EncodedVideoPacket),
-    AudioTrackPacket(EncodedAudioPacket),
     Ping(u64),
     Pong(u64),
+}
+
+impl SfuControlMessage {
+    pub fn to_wire_bytes(&self) -> Option<Vec<u8>> {
+        let json = serde_json::to_vec(self).ok()?;
+        let mut out = Vec::with_capacity(1 + json.len());
+        out.push(WIRE_TAG_CONTROL_JSON);
+        out.extend_from_slice(&json);
+        Some(out)
+    }
+
+    pub fn from_wire_bytes(data: &[u8]) -> Option<Self> {
+        if data.is_empty() {
+            return None;
+        }
+        if data[0] == WIRE_TAG_CONTROL_JSON {
+            serde_json::from_slice(&data[1..]).ok()
+        } else {
+            serde_json::from_slice(data).ok()
+        }
+    }
+}
+
+/// Extrai rapidamente o `sender` de um pacote binário de Vídeo (`0x02`) ou Áudio (`0x03`) sem deserializar o payload.
+pub fn peek_binary_packet_sender(data: &[u8]) -> Option<&str> {
+    if data.len() < 4 {
+        return None;
+    }
+    let tag = data[0];
+    if tag != WIRE_TAG_VIDEO_BINARY && tag != WIRE_TAG_AUDIO_BINARY {
+        return None;
+    }
+    let sender_len = u16::from_le_bytes([data[1], data[2]]) as usize;
+    if data.len() < 3 + sender_len {
+        return None;
+    }
+    std::str::from_utf8(&data[3..3 + sender_len]).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -120,12 +158,11 @@ pub enum NetworkEvent {
         jwt_token: String,
         livekit_reachable: bool,
     },
+    Reconnecting(String),
     Disconnected(String),
     ParticipantsUpdated(Vec<ParticipantInfo>),
     RemoteVideoFrame(DecodedVideoFrame),
     RemoteAudioFrame {
-        sender: String,
-        source_pid: u32,
         samples: Vec<i16>,
     },
     KeyframeRequested,
@@ -140,7 +177,7 @@ pub enum OutgoingCommand {
     Disconnect,
 }
 
-/// Cliente de rede para publicação (`LocalVideoTrack` / `LocalAudioTrack`) e consumo de tracks na sala.
+/// Cliente de rede Full-Duplex com reconexão automática e thread de decodificação isolada.
 pub struct RoomNetworkClient {
     cmd_tx: Sender<OutgoingCommand>,
     stop_flag: Arc<AtomicBool>,
@@ -152,7 +189,7 @@ impl RoomNetworkClient {
         local_participant: ParticipantInfo,
         event_tx: Sender<NetworkEvent>,
     ) -> Self {
-        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<OutgoingCommand>(256);
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<OutgoingCommand>(64);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
         let (host_str, port) = parse_server_endpoint(server_ip_input);
@@ -160,14 +197,16 @@ impl RoomNetworkClient {
         thread::Builder::new()
             .name("sfu-network-client".to_string())
             .spawn(move || {
-                run_network_worker(
-                    host_str,
-                    port,
-                    local_participant,
-                    cmd_rx,
-                    event_tx,
-                    stop_clone,
-                );
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    run_network_worker(
+                        host_str,
+                        port,
+                        local_participant,
+                        cmd_rx,
+                        event_tx,
+                        stop_clone,
+                    );
+                }));
             })
             .expect("Falha ao criar thread de rede SFU");
 
@@ -186,14 +225,6 @@ impl RoomNetworkClient {
             .try_send(OutgoingCommand::SubscribeToHost(target_identity));
     }
 
-    pub fn publish_video(&self, packet: EncodedVideoPacket) {
-        let _ = self.cmd_tx.try_send(OutgoingCommand::PublishVideo(packet));
-    }
-
-    pub fn publish_audio(&self, packet: EncodedAudioPacket) {
-        let _ = self.cmd_tx.try_send(OutgoingCommand::PublishAudio(packet));
-    }
-
     pub fn disconnect(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.try_send(OutgoingCommand::Disconnect);
@@ -210,9 +241,6 @@ impl Drop for RoomNetworkClient {
     }
 }
 
-/// Interpreta entradas como:
-/// - `127.0.0.1` ou `10.147.x.y` (ZeroTier/LAN) -> `(host, 7890)`
-/// - `algo.gl.at.ply.gg:45123` ou `147.185.221.20:45123` (Playit.gg / Ngrok) -> `(host, 45123)`
 fn parse_server_endpoint(input: &str) -> (String, u16) {
     let trimmed = input
         .trim()
@@ -222,7 +250,6 @@ fn parse_server_endpoint(input: &str) -> (String, u16) {
         .trim_start_matches("https://")
         .trim_start_matches("tcp://");
 
-    // Remover eventual caminho de URL após '/'
     let host_port = trimmed.split('/').next().unwrap_or("").trim();
 
     if host_port.is_empty() {
@@ -243,16 +270,14 @@ fn parse_server_endpoint(input: &str) -> (String, u16) {
     (host_port.to_string(), DEFAULT_SFU_RELAY_PORT)
 }
 
-/// Verifica se o LiveKit Server (`:7880`) está respondendo naquele IP (ou se é túnel customizado).
 fn probe_livekit_port(host: &str, relay_port: u16) -> bool {
     if relay_port != DEFAULT_SFU_RELAY_PORT {
-        // Quando conectado via túnel Playit.gg/Ngrok na porta customizada, o túnel aponta direto para o Hub
         return true;
     }
     let addr = format!("{}:7880", host);
     if let Ok(mut addrs) = std::net::ToSocketAddrs::to_socket_addrs(&addr) {
         if let Some(sock_addr) = addrs.next() {
-            return TcpStream::connect_timeout(&sock_addr, Duration::from_millis(600)).is_ok();
+            return TcpStream::connect_timeout(&sock_addr, Duration::from_millis(500)).is_ok();
         }
     }
     false
@@ -261,184 +286,297 @@ fn probe_livekit_port(host: &str, relay_port: u16) -> bool {
 fn run_network_worker(
     host: String,
     port: u16,
-    local_participant: ParticipantInfo,
+    mut current_participant: ParticipantInfo,
     cmd_rx: Receiver<OutgoingCommand>,
     event_tx: Sender<NetworkEvent>,
     stop_flag: Arc<AtomicBool>,
 ) {
     let jwt_token = generate_livekit_jwt(
-        &local_participant.identity,
-        &local_participant.nickname,
+        &current_participant.identity,
+        &current_participant.nickname,
         DEFAULT_ROOM_NAME,
     );
 
     let livekit_reachable = probe_livekit_port(&host, port);
     let ws_url = format!("ws://{}:{}/ws", host, port);
 
-    // Tentar conectar ao servidor Docker SFU Hub (:7890 ou porta do Playit.gg).
-    // Se for localhost na porta padrão e ainda não estiver aberto, inicia o mini-SFU embarcado.
-    let mut ws_conn = connect_ws_nonblocking(&ws_url);
-    if ws_conn.is_none()
-        && port == DEFAULT_SFU_RELAY_PORT
-        && (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"))
-    {
-        ensure_embedded_sfu_running();
-        thread::sleep(Duration::from_millis(120));
-        ws_conn = connect_ws_nonblocking(&ws_url);
-    }
-
-    let Some(mut socket) = ws_conn else {
-        let _ = event_tx.send(NetworkEvent::Disconnected(format!(
-            "Não foi possível conectar em {}:{}. Verifique o túnel Playit.gg/ZeroTier e se o Docker está ativo (`docker-compose up -d`).",
-            host, port
-        )));
-        return;
-    };
-
-    // Enviar JoinRoom com o JWT assinado
-    let join_msg = SfuWireMessage::JoinRoom {
-        jwt_token: jwt_token.clone(),
-        participant: local_participant.clone(),
-    };
-    if let Ok(bin) = serde_json::to_vec(&join_msg) {
-        let _ = socket.send(Message::Binary(bin));
-    }
-
-    let _ = event_tx.send(NetworkEvent::Connected {
-        server_endpoint: format!("{}:{}", host, port),
-        jwt_token,
-        livekit_reachable,
-    });
+    // Iniciar thread dedicada de decodificação de vídeo para NUNCA bloquear o socket TCP
+    let (vdec_tx, vdec_rx) = crossbeam_channel::bounded::<EncodedVideoPacket>(3);
+    let event_tx_vdec = event_tx.clone();
+    let stop_vdec = stop_flag.clone();
+    thread::Builder::new()
+        .name("video-decoder-worker".to_string())
+        .spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let mut decoder = VideoStreamDecoder::new();
+                while !stop_vdec.load(Ordering::Relaxed) {
+                    let Ok(mut pkt) = vdec_rx.recv_timeout(Duration::from_millis(50)) else {
+                        continue;
+                    };
+                    // Se for keyframe mais recente na fila, pular frames intermediários mas processar todos os deltas em ordem
+                    while let Ok(next_pkt) = vdec_rx.try_recv() {
+                        if next_pkt.is_keyframe {
+                            pkt = next_pkt;
+                        } else {
+                            if let Some(frame) = decoder.decode_packet(&pkt) {
+                                let _ = event_tx_vdec.try_send(NetworkEvent::RemoteVideoFrame(frame));
+                            }
+                            pkt = next_pkt;
+                        }
+                    }
+                    if let Some(frame) = decoder.decode_packet(&pkt) {
+                        let _ = event_tx_vdec.try_send(NetworkEvent::RemoteVideoFrame(frame));
+                    }
+                }
+            }));
+        })
+        .ok();
 
     let mut watched_host: Option<String> = None;
-    let mut last_ping = Instant::now();
-    let my_identity = local_participant.identity.clone();
+    let my_identity = current_participant.identity.clone();
+    let mut first_connect = true;
 
+    // Loop com reconexão automática transparente caso a conexão oscile durante stream dupla
     while !stop_flag.load(Ordering::Relaxed) {
-        let mut did_work = false;
-
-        // 1. Processar comandos de saída (Publicação de Vídeo/Áudio, Mudança de Estado)
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            did_work = true;
-            match cmd {
-                OutgoingCommand::UpdateLocalParticipant(info) => {
-                    if let Ok(bin) = serde_json::to_vec(&SfuWireMessage::UpdateParticipant(info)) {
-                        let _ = socket.send(Message::Binary(bin));
-                    }
-                }
-                OutgoingCommand::SubscribeToHost(target) => {
-                    watched_host = target.clone();
-                    let wire = match target {
-                        Some(host_id) => SfuWireMessage::SubscribeStream {
-                            viewer_identity: my_identity.clone(),
-                            target_host_identity: host_id,
-                        },
-                        None => SfuWireMessage::UnsubscribeStream {
-                            viewer_identity: my_identity.clone(),
-                        },
-                    };
-                    if let Ok(bin) = serde_json::to_vec(&wire) {
-                        let _ = socket.send(Message::Binary(bin));
-                    }
-                }
-                OutgoingCommand::PublishVideo(packet) => {
-                    if let Ok(bin) = serde_json::to_vec(&SfuWireMessage::VideoTrackPacket(packet)) {
-                        let _ = socket.send(Message::Binary(bin));
-                    }
-                }
-                OutgoingCommand::PublishAudio(packet) => {
-                    if let Ok(bin) = serde_json::to_vec(&SfuWireMessage::AudioTrackPacket(packet)) {
-                        let _ = socket.send(Message::Binary(bin));
-                    }
-                }
-                OutgoingCommand::Disconnect => {
-                    let _ = socket.close(None);
-                    return;
-                }
-            }
+        let mut ws_conn = connect_ws_nonblocking(&ws_url);
+        if ws_conn.is_none()
+            && port == DEFAULT_SFU_RELAY_PORT
+            && (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"))
+        {
+            ensure_embedded_sfu_running();
+            thread::sleep(Duration::from_millis(100));
+            ws_conn = connect_ws_nonblocking(&ws_url);
         }
 
-        // 2. Enviar Ping periódico de telemetria a cada 2s
-        if last_ping.elapsed() >= Duration::from_secs(2) {
-            last_ping = Instant::now();
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            if let Ok(bin) = serde_json::to_vec(&SfuWireMessage::Ping(now_ms)) {
+        let Some(mut socket) = ws_conn else {
+            if first_connect {
+                let _ = event_tx.send(NetworkEvent::Disconnected(format!(
+                    "Não foi possível conectar em {}:{}. Verifique o IP ZeroTier/Playit e o Docker.",
+                    host, port
+                )));
+                return;
+            } else {
+                let _ = event_tx.send(NetworkEvent::Reconnecting(format!(
+                    "Reconectando a {}:{}...",
+                    host, port
+                )));
+                thread::sleep(Duration::from_millis(400));
+                continue;
+            }
+        };
+
+        // Enviar JoinRoom
+        if let Some(bin) = (SfuControlMessage::JoinRoom {
+            jwt_token: jwt_token.clone(),
+            participant: current_participant.clone(),
+        })
+        .to_wire_bytes()
+        {
+            let _ = socket.send(Message::Binary(bin));
+        }
+
+        // Se já estávamos assistindo alguém antes de uma oscilação, re-assinar automaticamente
+        if let Some(ref target_host) = watched_host {
+            if let Some(bin) = (SfuControlMessage::SubscribeStream {
+                viewer_identity: my_identity.clone(),
+                target_host_identity: target_host.clone(),
+            })
+            .to_wire_bytes()
+            {
                 let _ = socket.send(Message::Binary(bin));
             }
         }
 
-        // 3. Ler pacotes recebidos da sala SFU
-        match socket.read() {
-            Ok(Message::Binary(data)) => {
+        if first_connect {
+            first_connect = false;
+            let _ = event_tx.send(NetworkEvent::Connected {
+                server_endpoint: format!("{}:{}", host, port),
+                jwt_token: jwt_token.clone(),
+                livekit_reachable,
+            });
+        }
+
+        let mut last_ping = Instant::now();
+        let mut connection_alive = true;
+
+        while connection_alive && !stop_flag.load(Ordering::Relaxed) {
+            let mut did_work = false;
+
+            // 1. Enviar pacotes na fila de saída (limitando burst por ciclo para priorizar leitura full-duplex)
+            let mut sent_this_tick = 0;
+            while sent_this_tick < 8 {
+                let Ok(cmd) = cmd_rx.try_recv() else {
+                    break;
+                };
                 did_work = true;
-                if let Ok(msg) = serde_json::from_slice::<SfuWireMessage>(&data) {
-                    match msg {
-                        SfuWireMessage::RoomState { participants } => {
-                            let _ = event_tx.send(NetworkEvent::ParticipantsUpdated(participants));
-                        }
-                        SfuWireMessage::RequestKeyframe {
-                            target_host_identity,
-                        } => {
-                            if target_host_identity == my_identity {
-                                let _ = event_tx.send(NetworkEvent::KeyframeRequested);
+                sent_this_tick += 1;
+
+                match cmd {
+                    OutgoingCommand::UpdateLocalParticipant(info) => {
+                        current_participant = info.clone();
+                        if let Some(bin) =
+                            SfuControlMessage::UpdateParticipant(info).to_wire_bytes()
+                        {
+                            if !send_ws_resilient(&mut socket, bin) {
+                                connection_alive = false;
+                                break;
                             }
                         }
-                        SfuWireMessage::VideoTrackPacket(packet) => {
-                            if watched_host.as_deref() == Some(packet.sender.as_str()) {
-                                if let Some(decoded) = decode_video_packet(&packet) {
-                                    let _ =
-                                        event_tx.try_send(NetworkEvent::RemoteVideoFrame(decoded));
-                                }
+                    }
+                    OutgoingCommand::SubscribeToHost(target) => {
+                        watched_host = target.clone();
+                        let ctrl = match target {
+                            Some(host_id) => SfuControlMessage::SubscribeStream {
+                                viewer_identity: my_identity.clone(),
+                                target_host_identity: host_id,
+                            },
+                            None => SfuControlMessage::UnsubscribeStream {
+                                viewer_identity: my_identity.clone(),
+                            },
+                        };
+                        if let Some(bin) = ctrl.to_wire_bytes() {
+                            if !send_ws_resilient(&mut socket, bin) {
+                                connection_alive = false;
+                                break;
                             }
                         }
-                        SfuWireMessage::AudioTrackPacket(packet) => {
-                            if watched_host.as_deref() == Some(packet.sender.as_str()) {
-                                if let Some(samples) = decode_audio_packet(&packet) {
-                                    let _ = event_tx.try_send(NetworkEvent::RemoteAudioFrame {
-                                        sender: packet.sender,
-                                        source_pid: packet.source_pid,
-                                        samples,
-                                    });
-                                }
-                            }
+                    }
+                    OutgoingCommand::PublishVideo(packet) => {
+                        let bin = packet.to_wire_bytes();
+                        if !send_ws_resilient(&mut socket, bin) {
+                            connection_alive = false;
+                            break;
                         }
-                        SfuWireMessage::Pong(sent_ms) => {
-                            let now_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64;
-                            let rtt = now_ms.saturating_sub(sent_ms);
-                            let _ = event_tx.send(NetworkEvent::LatencyUpdatedMs(rtt));
+                    }
+                    OutgoingCommand::PublishAudio(packet) => {
+                        let bin = packet.to_wire_bytes();
+                        if !send_ws_resilient(&mut socket, bin) {
+                            connection_alive = false;
+                            break;
                         }
-                        _ => {}
+                    }
+                    OutgoingCommand::Disconnect => {
+                        let _ = socket.close(None);
+                        return;
                     }
                 }
             }
-            Ok(Message::Close(_)) => {
-                let _ = event_tx.send(NetworkEvent::Disconnected(
-                    "Conexão encerrada pelo servidor.".to_string(),
-                ));
-                break;
-            }
-            Err(tungstenite::Error::Io(ref err))
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(err) => {
-                let _ = event_tx.send(NetworkEvent::Disconnected(format!(
-                    "Conexão perdida: {}",
-                    err
-                )));
-                break;
-            }
-            _ => {}
-        }
 
-        if !did_work {
-            thread::sleep(Duration::from_millis(2));
+            if !connection_alive {
+                break;
+            }
+
+            // 2. Ping periódico a cada 2 segundos
+            if last_ping.elapsed() >= Duration::from_secs(2) {
+                last_ping = Instant::now();
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if let Some(bin) = SfuControlMessage::Ping(now_ms).to_wire_bytes() {
+                    let _ = send_ws_resilient(&mut socket, bin);
+                }
+            }
+
+            // 3. Drenar todos os pacotes recebidos disponíveis no socket não-bloqueante
+            for _ in 0..16 {
+                match socket.read() {
+                    Ok(Message::Binary(data)) => {
+                        did_work = true;
+                        if data.is_empty() {
+                            continue;
+                        }
+                        match data[0] {
+                            WIRE_TAG_VIDEO_BINARY => {
+                                if let Some(pkt) = EncodedVideoPacket::from_wire_bytes(&data) {
+                                    if watched_host.as_deref() == Some(pkt.sender.as_str()) {
+                                        let _ = vdec_tx.try_send(pkt);
+                                    }
+                                }
+                            }
+                            WIRE_TAG_AUDIO_BINARY => {
+                                if let Some(pkt) = EncodedAudioPacket::from_wire_bytes(&data) {
+                                    if watched_host.as_deref() == Some(pkt.sender.as_str()) {
+                                        if let Some(samples) = decode_audio_packet(&pkt) {
+                                            let _ = event_tx
+                                                .try_send(NetworkEvent::RemoteAudioFrame { samples });
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                if let Some(msg) = SfuControlMessage::from_wire_bytes(&data) {
+                                    match msg {
+                                        SfuControlMessage::RoomState { participants } => {
+                                            let _ = event_tx.send(
+                                                NetworkEvent::ParticipantsUpdated(participants),
+                                            );
+                                        }
+                                        SfuControlMessage::RequestKeyframe {
+                                            target_host_identity,
+                                        } => {
+                                            if target_host_identity == my_identity {
+                                                let _ =
+                                                    event_tx.send(NetworkEvent::KeyframeRequested);
+                                            }
+                                        }
+                                        SfuControlMessage::Pong(sent_ms) => {
+                                            let now_ms = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis()
+                                                as u64;
+                                            let rtt = now_ms.saturating_sub(sent_ms);
+                                            let _ =
+                                                event_tx.send(NetworkEvent::LatencyUpdatedMs(rtt));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) => {
+                        connection_alive = false;
+                        break;
+                    }
+                    Err(tungstenite::Error::Io(ref err))
+                        if err.kind() == ErrorKind::WouldBlock
+                            || err.kind() == ErrorKind::TimedOut
+                            || err.kind() == ErrorKind::Interrupted =>
+                    {
+                        break;
+                    }
+                    Err(_) => {
+                        connection_alive = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            let _ = socket.flush();
+
+            if !did_work {
+                thread::sleep(Duration::from_millis(1));
+            }
         }
+    }
+}
+
+/// Envia uma mensagem binária tratando `WouldBlock`/`TimedOut` sem derrubar a conexão TCP.
+fn send_ws_resilient(socket: &mut WebSocket<TcpStream>, data: Vec<u8>) -> bool {
+    match socket.send(Message::Binary(data)) {
+        Ok(()) => true,
+        Err(tungstenite::Error::Io(ref err))
+            if err.kind() == ErrorKind::WouldBlock
+                || err.kind() == ErrorKind::TimedOut
+                || err.kind() == ErrorKind::Interrupted =>
+        {
+            let _ = socket.flush();
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -453,32 +591,30 @@ fn connect_ws_nonblocking(ws_url: &str) -> Option<WebSocket<TcpStream>> {
     let tcp = TcpStream::connect_timeout(&sock_addr, Duration::from_millis(3500)).ok()?;
     let _ = tcp.set_nodelay(true);
     let (socket, _resp) = tungstenite::client::client(ws_url, tcp).ok()?;
-    let _ = socket
-        .get_ref()
-        .set_read_timeout(Some(Duration::from_millis(4)));
+    // Usar modo nonblocking após o handshake WebSocket para leitura/escrita full-duplex sem conflitos de timeout
+    let _ = socket.get_ref().set_nonblocking(true);
     Some(socket)
 }
-
-static EMBEDDED_SFU_STARTED: AtomicBool = AtomicBool::new(false);
 
 struct ClientPeer {
     info: ParticipantInfo,
     watching: Option<String>,
-    tx: Sender<Vec<u8>>,
+    ctrl_tx: Sender<Vec<u8>>,
+    media_tx: Sender<Vec<u8>>,
 }
 
 fn broadcast_room_state(peers: &Arc<Mutex<HashMap<String, ClientPeer>>>) {
     let map = peers.lock();
     let participants: Vec<ParticipantInfo> = map.values().map(|p| p.info.clone()).collect();
-    if let Ok(bin) = serde_json::to_vec(&SfuWireMessage::RoomState { participants }) {
+    if let Some(bin) = (SfuControlMessage::RoomState { participants }).to_wire_bytes() {
         for peer in map.values() {
-            let _ = peer.tx.try_send(bin.clone());
+            let _ = peer.ctrl_tx.try_send(bin.clone());
         }
     }
 }
 
-/// Caso o usuário próprio seja o Host P2P ou o container SFU secundário não esteja na porta 7890,
-/// sobe automaticamente um servidor SFU leve na porta 7890 capaz de atender até 10 amigos simultaneamente.
+static EMBEDDED_SFU_STARTED: AtomicBool = AtomicBool::new(false);
+
 pub fn ensure_embedded_sfu_running() {
     if EMBEDDED_SFU_STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -500,136 +636,173 @@ pub fn ensure_embedded_sfu_running() {
                 let peers_ref = peers.clone();
 
                 thread::spawn(move || {
-                    let Ok(mut ws) = accept(stream) else {
-                        return;
-                    };
-                    let _ = ws
-                        .get_ref()
-                        .set_read_timeout(Some(Duration::from_millis(5)));
-
-                    let (out_tx, out_rx) = crossbeam_channel::bounded::<Vec<u8>>(256);
-                    let mut my_id: Option<String> = None;
-
-                    loop {
-                        while let Ok(bin) = out_rx.try_recv() {
-                            if ws.send(Message::Binary(bin)).is_err() {
-                                break;
-                            }
-                        }
-
-                        match ws.read() {
-                            Ok(Message::Binary(data)) => {
-                                let Ok(msg) = serde_json::from_slice::<SfuWireMessage>(&data)
-                                else {
-                                    continue;
-                                };
-                                match msg {
-                                    SfuWireMessage::JoinRoom { participant, .. } => {
-                                        let id = participant.identity.clone();
-                                        my_id = Some(id.clone());
-                                        {
-                                            let mut map = peers_ref.lock();
-                                            if map.len() < 10 {
-                                                map.insert(
-                                                    id,
-                                                    ClientPeer {
-                                                        info: participant,
-                                                        watching: None,
-                                                        tx: out_tx.clone(),
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        broadcast_room_state(&peers_ref);
-                                    }
-                                    SfuWireMessage::UpdateParticipant(info) => {
-                                        {
-                                            let mut map = peers_ref.lock();
-                                            if let Some(peer) = map.get_mut(&info.identity) {
-                                                peer.info = info;
-                                            }
-                                        }
-                                        broadcast_room_state(&peers_ref);
-                                    }
-                                    SfuWireMessage::SubscribeStream {
-                                        viewer_identity,
-                                        target_host_identity,
-                                    } => {
-                                        let mut host_tx = None;
-                                        {
-                                            let mut map = peers_ref.lock();
-                                            if let Some(viewer) = map.get_mut(&viewer_identity) {
-                                                viewer.watching =
-                                                    Some(target_host_identity.clone());
-                                            }
-                                            if let Some(host) = map.get(&target_host_identity) {
-                                                host_tx = Some(host.tx.clone());
-                                            }
-                                        }
-                                        if let Some(tx) = host_tx {
-                                            if let Ok(req) = serde_json::to_vec(
-                                                &SfuWireMessage::RequestKeyframe {
-                                                    target_host_identity,
-                                                },
-                                            ) {
-                                                let _ = tx.try_send(req);
-                                            }
-                                        }
-                                    }
-                                    SfuWireMessage::UnsubscribeStream { viewer_identity } => {
-                                        let mut map = peers_ref.lock();
-                                        if let Some(viewer) = map.get_mut(&viewer_identity) {
-                                            viewer.watching = None;
-                                        }
-                                    }
-                                    SfuWireMessage::VideoTrackPacket(ref pkt) => {
-                                        let sender_id = pkt.sender.clone();
-                                        let map = peers_ref.lock();
-                                        for peer in map.values() {
-                                            if peer.watching.as_deref() == Some(sender_id.as_str())
-                                            {
-                                                let _ = peer.tx.try_send(data.clone());
-                                            }
-                                        }
-                                    }
-                                    SfuWireMessage::AudioTrackPacket(ref pkt) => {
-                                        let sender_id = pkt.sender.clone();
-                                        let map = peers_ref.lock();
-                                        for peer in map.values() {
-                                            if peer.watching.as_deref() == Some(sender_id.as_str())
-                                            {
-                                                let _ = peer.tx.try_send(data.clone());
-                                            }
-                                        }
-                                    }
-                                    SfuWireMessage::Ping(ts) => {
-                                        if let Ok(pong) =
-                                            serde_json::to_vec(&SfuWireMessage::Pong(ts))
-                                        {
-                                            let _ = out_tx.try_send(pong);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Ok(Message::Close(_)) => break,
-                            Err(tungstenite::Error::Io(ref e))
-                                if e.kind() == std::io::ErrorKind::WouldBlock
-                                    || e.kind() == std::io::ErrorKind::TimedOut =>
-                            {
-                                thread::sleep(Duration::from_millis(2));
-                            }
-                            Err(_) => break,
-                            _ => {}
-                        }
-                    }
-
-                    if let Some(id) = my_id {
-                        peers_ref.lock().remove(&id);
-                        broadcast_room_state(&peers_ref);
-                    }
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        handle_embedded_peer(stream, peers_ref);
+                    }));
                 });
             }
         })
         .ok();
+}
+
+fn handle_embedded_peer(
+    stream: TcpStream,
+    peers_ref: Arc<Mutex<HashMap<String, ClientPeer>>>,
+) {
+    let Ok(mut ws) = accept(stream) else {
+        return;
+    };
+    let _ = ws.get_ref().set_nonblocking(true);
+
+    let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+    let (media_tx, media_rx) = crossbeam_channel::bounded::<Vec<u8>>(48);
+    let mut my_id: Option<String> = None;
+
+    loop {
+        let mut active = false;
+
+        while let Ok(bin) = ctrl_rx.try_recv() {
+            active = true;
+            if !send_ws_resilient(&mut ws, bin) {
+                break;
+            }
+        }
+
+        let mut media_sent = 0;
+        while media_sent < 12 {
+            let Ok(bin) = media_rx.try_recv() else {
+                break;
+            };
+            active = true;
+            media_sent += 1;
+            if !send_ws_resilient(&mut ws, bin) {
+                break;
+            }
+        }
+
+        for _ in 0..16 {
+            match ws.read() {
+                Ok(Message::Binary(data)) => {
+                    active = true;
+                    if data.is_empty() {
+                        continue;
+                    }
+                    match data[0] {
+                        WIRE_TAG_VIDEO_BINARY | WIRE_TAG_AUDIO_BINARY => {
+                            if let Some(sender_id) = peek_binary_packet_sender(&data) {
+                                let map = peers_ref.lock();
+                                for peer in map.values() {
+                                    if peer.watching.as_deref() == Some(sender_id) {
+                                        let _ = peer.media_tx.try_send(data.clone());
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            let Some(msg) = SfuControlMessage::from_wire_bytes(&data) else {
+                                continue;
+                            };
+                            match msg {
+                                SfuControlMessage::JoinRoom { participant, .. } => {
+                                    let id = participant.identity.clone();
+                                    my_id = Some(id.clone());
+                                    {
+                                        let mut map = peers_ref.lock();
+                                        let prev_watching =
+                                            map.get(&id).and_then(|p| p.watching.clone());
+                                        if map.len() < 10 || map.contains_key(&id) {
+                                            map.insert(
+                                                id,
+                                                ClientPeer {
+                                                    info: participant,
+                                                    watching: prev_watching,
+                                                    ctrl_tx: ctrl_tx.clone(),
+                                                    media_tx: media_tx.clone(),
+                                                },
+                                            );
+                                        }
+                                    }
+                                    broadcast_room_state(&peers_ref);
+                                }
+                                SfuControlMessage::UpdateParticipant(info) => {
+                                    {
+                                        let mut map = peers_ref.lock();
+                                        if let Some(peer) = map.get_mut(&info.identity) {
+                                            peer.info = info;
+                                        }
+                                    }
+                                    broadcast_room_state(&peers_ref);
+                                }
+                                SfuControlMessage::SubscribeStream {
+                                    viewer_identity,
+                                    target_host_identity,
+                                } => {
+                                    let mut host_tx = None;
+                                    {
+                                        let mut map = peers_ref.lock();
+                                        if let Some(viewer) = map.get_mut(&viewer_identity) {
+                                            viewer.watching = Some(target_host_identity.clone());
+                                        }
+                                        if let Some(host) = map.get(&target_host_identity) {
+                                            host_tx = Some(host.ctrl_tx.clone());
+                                        }
+                                    }
+                                    if let Some(tx) = host_tx {
+                                        if let Some(req) = (SfuControlMessage::RequestKeyframe {
+                                            target_host_identity,
+                                        })
+                                        .to_wire_bytes()
+                                        {
+                                            let _ = tx.try_send(req);
+                                        }
+                                    }
+                                }
+                                SfuControlMessage::UnsubscribeStream { viewer_identity } => {
+                                    let mut map = peers_ref.lock();
+                                    if let Some(viewer) = map.get_mut(&viewer_identity) {
+                                        viewer.watching = None;
+                                    }
+                                }
+                                SfuControlMessage::Ping(ts) => {
+                                    if let Some(pong) = SfuControlMessage::Pong(ts).to_wire_bytes()
+                                    {
+                                        let _ = ctrl_tx.try_send(pong);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    if let Some(id) = my_id.take() {
+                        peers_ref.lock().remove(&id);
+                        broadcast_room_state(&peers_ref);
+                    }
+                    return;
+                }
+                Err(tungstenite::Error::Io(ref e))
+                    if e.kind() == ErrorKind::WouldBlock
+                        || e.kind() == ErrorKind::TimedOut
+                        || e.kind() == ErrorKind::Interrupted =>
+                {
+                    break;
+                }
+                Err(_) => {
+                    if let Some(id) = my_id.take() {
+                        peers_ref.lock().remove(&id);
+                        broadcast_room_state(&peers_ref);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let _ = ws.flush();
+
+        if !active {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
