@@ -1,0 +1,32 @@
+# LiveKit Server Configuration - Self-Hosted Screen Share (Windows 11)
+port: 7880
+bind_addresses:
+  - "0.0.0.0"
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  # Enable external IP discovery via STUN when needed, while allowing LAN/Tailscale IPs
+  use_external_ip: false
+  enable_loopback_candidate: true
+
+room:
+  auto_create: true
+  empty_timeout: 300
+  max_participants: 10
+  enabled_codecs:
+    - mime: video/H264
+    - mime: video/VP8
+    - mime: video/AV1
+    - mime: audio/opus
+
+# Static API Key & Secret for Private Group (up to 10 friends)
+# Note: Secret must be at least 32 characters long for LiveKit HMAC-SHA256 validation
+keys:
+  APIScreenSharePrivateKey: "SecretScreenShareKeyForFriends2026Win11Native!"
+
+logging:
+  level: info
+  pion_level: error
+

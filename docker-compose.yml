@@ -1,0 +1,32 @@
+services:
+  livekit-server:
+    image: livekit/livekit-server:latest
+    container_name: screenshare-livekit-sfu
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    ports:
+      - "${LIVEKIT_PORT:-7880}:7880/tcp"
+      - "${LIVEKIT_TCP_PORT:-7881}:7881/tcp"
+      - "50000-50100:50000-50100/udp"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-APIScreenSharePrivateKey}: ${LIVEKIT_API_SECRET:-SecretScreenShareKeyForFriends2026Win11Native!}"
+
+  screenshare-hub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: screenshare-sfu-hub
+    restart: unless-stopped
+    depends_on:
+      - livekit-server
+    ports:
+      - "7890:7890/tcp"
+      - "7888:7888/tcp"
+    volumes:
+      - ./dist:/dist
+    environment:
+      - LIVEKIT_URL=ws://livekit-server:7880
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY:-APIScreenSharePrivateKey}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET:-SecretScreenShareKeyForFriends2026Win11Native!}

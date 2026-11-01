@@ -1,0 +1,75 @@
+name: Build & Publish Windows 11 Release (.exe)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Versão da Release (ex: v0.1.0)"
+        required: false
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-exe:
+    name: Compile Portable Windows 11 .exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Stable Toolchain (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust Cargo Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Optimized Single Executable (--release)
+        run: cargo build --release --bin screenshare-win11
+
+      - name: Verify Portable Executable Size & Integrity
+        shell: pwsh
+        run: |
+          $exePath = "target/release/screenshare-win11.exe"
+          if (-not (Test-Path $exePath)) {
+            throw "Executável não encontrado em $exePath"
+          }
+          $sizeMb = [math]::Round((Get-Item $exePath).Length / 1MB, 2)
+          Write-Host "Build concluída com sucesso: $exePath ($sizeMb MB)"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item $exePath "dist/screenshare-win11.exe" -Force
+          Get-FileHash "dist/screenshare-win11.exe" -Algorithm SHA256 | Format-List
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshare-win11-portable-exe
+          path: dist/screenshare-win11.exe
+
+      - name: Publish GitHub Release (Private Repo)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.1.0' }}
+          name: "ScreenShare Win11 Native ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.1.0' }}"
+          body: |
+            ## ⚡ ScreenShare Win11 Native — Executável Portátil (Windows 11)
+            
+            ### Como usar (Para os amigos):
+            1. Baixe o arquivo **`screenshare-win11.exe`** anexado abaixo em **Assets**.
+            2. Abra o `screenshare-win11.exe` (não requer instalação).
+            3. Digite o **IP do Host** (Tailscale ou IP Público) + seu **Nickname** e clique em **Conectar à Sala**.
+            4. Para transmitir uma janela com áudio isolado (sem capturar o Discord), clique em **Compartilhar Tela / Janela**, escolha a janela, marque **Compartilhar áudio desta janela (WASAPI PID)** e selecione a qualidade (`720p`, `1080p` ou `Nativo`).
+          files: |
+            dist/screenshare-win11.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
