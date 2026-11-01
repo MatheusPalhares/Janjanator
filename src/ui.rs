@@ -573,15 +573,16 @@ impl ScreenShareApp {
                         ui.add_space(20.0);
 
                         ui.label(
-                            RichText::new("IP / Host do Servidor (Docker LiveKit ou Tailscale):")
+                            RichText::new("Endereço do Servidor (Playit.gg, ZeroTier ou IP):")
                                 .size(13.0)
                                 .strong(),
                         );
                         ui.add_space(4.0);
                         ui.add_sized(
                             [400.0, 32.0],
-                            egui::TextEdit::singleline(&mut self.server_ip)
-                                .hint_text("Ex: 127.0.0.1 ou 100.x.y.z (Tailscale)"),
+                            egui::TextEdit::singleline(&mut self.server_ip).hint_text(
+                                "Ex: algo.gl.at.ply.gg:PORTA, IP ZeroTier ou 127.0.0.1",
+                            ),
                         );
 
                         ui.add_space(12.0);

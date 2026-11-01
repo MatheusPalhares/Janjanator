@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tungstenite::protocol::WebSocket;
-use tungstenite::{accept, Message};
+use tungstenite::{accept, connect, Message};
 
 use crate::codec::{decode_audio_packet, decode_video_packet};
 use crate::types::{
@@ -155,12 +155,19 @@ impl RoomNetworkClient {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<OutgoingCommand>(256);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
-        let host_str = normalize_host(server_ip_input);
+        let (host_str, port) = parse_server_endpoint(server_ip_input);
 
         thread::Builder::new()
             .name("sfu-network-client".to_string())
             .spawn(move || {
-                run_network_worker(host_str, local_participant, cmd_rx, event_tx, stop_clone);
+                run_network_worker(
+                    host_str,
+                    port,
+                    local_participant,
+                    cmd_rx,
+                    event_tx,
+                    stop_clone,
+                );
             })
             .expect("Falha ao criar thread de rede SFU");
 
@@ -203,27 +210,45 @@ impl Drop for RoomNetworkClient {
     }
 }
 
-fn normalize_host(input: &str) -> String {
+/// Interpreta entradas como:
+/// - `127.0.0.1` ou `10.147.x.y` (ZeroTier/LAN) -> `(host, 7890)`
+/// - `algo.gl.at.ply.gg:45123` ou `147.185.221.20:45123` (Playit.gg / Ngrok) -> `(host, 45123)`
+fn parse_server_endpoint(input: &str) -> (String, u16) {
     let trimmed = input
         .trim()
         .trim_start_matches("ws://")
         .trim_start_matches("wss://")
         .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    if let Some((host, _port)) = trimmed.split_once(':') {
+        .trim_start_matches("https://")
+        .trim_start_matches("tcp://");
+
+    // Remover eventual caminho de URL após '/'
+    let host_port = trimmed.split('/').next().unwrap_or("").trim();
+
+    if host_port.is_empty() {
+        return ("127.0.0.1".to_string(), DEFAULT_SFU_RELAY_PORT);
+    }
+
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
         if !host.is_empty() {
-            return host.to_string();
+            if let Ok(custom_port) = port_str.trim().parse::<u16>() {
+                if custom_port > 0 {
+                    return (host.trim().to_string(), custom_port);
+                }
+            }
+            return (host.trim().to_string(), DEFAULT_SFU_RELAY_PORT);
         }
     }
-    if trimmed.is_empty() {
-        "127.0.0.1".to_string()
-    } else {
-        trimmed.to_string()
-    }
+
+    (host_port.to_string(), DEFAULT_SFU_RELAY_PORT)
 }
 
-/// Verifica se o LiveKit Server (`:7880`) está respondendo naquele IP.
-fn probe_livekit_port(host: &str) -> bool {
+/// Verifica se o LiveKit Server (`:7880`) está respondendo naquele IP (ou se é túnel customizado).
+fn probe_livekit_port(host: &str, relay_port: u16) -> bool {
+    if relay_port != DEFAULT_SFU_RELAY_PORT {
+        // Quando conectado via túnel Playit.gg/Ngrok na porta customizada, o túnel aponta direto para o Hub
+        return true;
+    }
     let addr = format!("{}:7880", host);
     if let Ok(mut addrs) = std::net::ToSocketAddrs::to_socket_addrs(&addr) {
         if let Some(sock_addr) = addrs.next() {
@@ -235,6 +260,7 @@ fn probe_livekit_port(host: &str) -> bool {
 
 fn run_network_worker(
     host: String,
+    port: u16,
     local_participant: ParticipantInfo,
     cmd_rx: Receiver<OutgoingCommand>,
     event_tx: Sender<NetworkEvent>,
@@ -246,13 +272,16 @@ fn run_network_worker(
         DEFAULT_ROOM_NAME,
     );
 
-    let livekit_reachable = probe_livekit_port(&host);
-    let ws_url = format!("ws://{}:{}/ws", host, DEFAULT_SFU_RELAY_PORT);
+    let livekit_reachable = probe_livekit_port(&host, port);
+    let ws_url = format!("ws://{}:{}/ws", host, port);
 
-    // Tentar conectar ao servidor Docker SFU Hub (:7890). Se for localhost e ainda não estiver aberto,
-    // inicia automaticamente um mini-SFU embarcado para garantir funcionamento P2P/Local imediato.
+    // Tentar conectar ao servidor Docker SFU Hub (:7890 ou porta do Playit.gg).
+    // Se for localhost na porta padrão e ainda não estiver aberto, inicia o mini-SFU embarcado.
     let mut ws_conn = connect_ws_nonblocking(&ws_url);
-    if ws_conn.is_none() && (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")) {
+    if ws_conn.is_none()
+        && port == DEFAULT_SFU_RELAY_PORT
+        && (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"))
+    {
         ensure_embedded_sfu_running();
         thread::sleep(Duration::from_millis(120));
         ws_conn = connect_ws_nonblocking(&ws_url);
@@ -260,8 +289,8 @@ fn run_network_worker(
 
     let Some(mut socket) = ws_conn else {
         let _ = event_tx.send(NetworkEvent::Disconnected(format!(
-            "Não foi possível conectar ao servidor em {} (portas 7880/7890). Verifique se o Docker está ativo (`docker-compose up -d`).",
-            host
+            "Não foi possível conectar em {}:{}. Verifique o túnel Playit.gg/ZeroTier e se o Docker está ativo (`docker-compose up -d`).",
+            host, port
         )));
         return;
     };
@@ -276,7 +305,7 @@ fn run_network_worker(
     }
 
     let _ = event_tx.send(NetworkEvent::Connected {
-        server_endpoint: format!("{}:7880 (LiveKit SFU)", host),
+        server_endpoint: format!("{}:{}", host, port),
         jwt_token,
         livekit_reachable,
     });
@@ -421,7 +450,7 @@ fn connect_ws_nonblocking(ws_url: &str) -> Option<WebSocket<TcpStream>> {
     let mut addrs = std::net::ToSocketAddrs::to_socket_addrs(&addr_str).ok()?;
     let sock_addr = addrs.next()?;
 
-    let tcp = TcpStream::connect_timeout(&sock_addr, Duration::from_millis(1200)).ok()?;
+    let tcp = TcpStream::connect_timeout(&sock_addr, Duration::from_millis(3500)).ok()?;
     let _ = tcp.set_nodelay(true);
     let (socket, _resp) = tungstenite::client::client(ws_url, tcp).ok()?;
     let _ = socket

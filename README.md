@@ -47,13 +47,23 @@ docker-compose ps
 
 ### 2. Como Conectar seus Amigos ao seu Servidor (Opções de Rede)
 
-#### 🟢 Opção A: Tailscale ou ZeroTier (Recomendada — Zero Configuração de Roteador)
-Ideal para grupos fechados de até 10 amigos, sem precisar abrir portas no roteador e funcionando mesmo em operadoras com CGNAT:
-1. Instale o [Tailscale](https://tailscale.com/) (ou ZeroTier) no seu PC e nos PCs dos seus amigos na mesma rede privada.
-2. Copie o seu **IP do Tailscale** (ex: `100.x.y.z`).
-3. Passe esse IP para os seus amigos colocarem no campo **"IP / Host do Servidor"** do `screenshare-win11.exe`.
+#### 🟣 Opção 1: Playit.gg (Mais Prática — Sem instalar VPN nos amigos e sem abrir portas)
+Como toda a comunicação de sala, vídeo e áudio isolado do aplicativo passa pela porta TCP **`7890`**, você pode criar um único túnel no **Playit.gg**:
+1. Abra o agente do **Playit.gg** no seu PC e acesse o painel web do Playit.
+2. Crie um novo túnel com as seguintes configurações:
+   - **Tunnel Type:** `TCP` (Custom TCP)
+   - **Local Address:** `127.0.0.1`
+   - **Local Port:** `7890`
+3. O Playit irá gerar um endereço público no formato `exemplo.gl.at.ply.gg:45123` (ou `147.185.x.y:45123`).
+4. Basta enviar esse endereço `HOST:PORTA` para os seus amigos colarem diretamente no campo **"Endereço do Servidor"** do `screenshare-win11.exe`!
 
-#### 🔵 Opção B: Port Forwarding no Roteador (Conexão Direta via IP Público)
+#### 🟢 Opção 2: ZeroTier ou Tailscale (Zero Configuração de Roteador via Rede Virtual)
+Ideal para menor latência possível (conexão direta P2P UDP Hole Punching entre os PCs):
+1. Conecte você e seus amigos na mesma rede do **ZeroTier** (ou Tailscale).
+2. Copie o seu **IPv4 Managed do ZeroTier** (ex: `10.147.x.y` ou `192.168.192.x`).
+3. Passe apenas esse IP (sem porta) para os seus amigos colocarem no `screenshare-win11.exe` (o app usará a porta `7890` automaticamente).
+
+#### 🔵 Opção 3: Port Forwarding no Roteador (Conexão Direta via IP Público)
 Se preferir que seus amigos conectem diretamente pelo seu IP público sem instalar VPN:
 1. Acesse o painel do seu roteador e crie regras de **Port Forwarding (Redirecionamento de Portas)** apontando para o IP LAN do seu PC:
    - **TCP `7880`** (Sinalização LiveKit)
