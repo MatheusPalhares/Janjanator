@@ -16,7 +16,7 @@ use crate::codec::{detect_hardware_video_encoder, LowLatencyAudioEncoder, LowLat
 use crate::network::{NetworkEvent, OutgoingCommand, RoomNetworkClient};
 use crate::types::{
     BitratePreset, CaptureEvent, CaptureTarget, CaptureTargetKind, DecodedVideoFrame, FpsPreset,
-    ParticipantInfo, ResolutionPreset,
+    ParticipantInfo, ResolutionPreset, APP_VERSION,
 };
 
 pub struct ScreenShareApp {
@@ -181,11 +181,11 @@ impl ScreenShareApp {
         }
 
         let (net_tx, net_rx) = crossbeam_channel::bounded::<NetworkEvent>(256);
-        let local_info = self.build_local_participant_info();
-        let client = RoomNetworkClient::connect(&self.server_ip, local_info, net_tx);
-
         let (pcm_tx, pcm_rx) = crossbeam_channel::bounded::<Vec<i16>>(128);
         let player = AudioPlaybackEngine::start(pcm_rx, self.watching_local_volume_pct);
+
+        let local_info = self.build_local_participant_info();
+        let client = RoomNetworkClient::connect(&self.server_ip, local_info, net_tx, pcm_tx.clone());
 
         self.net_client = Some(client);
         self.net_event_rx = Some(net_rx);
@@ -300,6 +300,35 @@ impl ScreenShareApp {
         let want_preview = self.want_self_preview_atomic.clone();
         let net_client_ref = self.net_client.as_ref().map(|c| c.inner_sender());
 
+        // Thread dedicada de codificação de Áudio (100% isolada do encoder de vídeo 1080p!)
+        let stop_audio_enc = stop_flag.clone();
+        let my_id_audio = my_id.clone();
+        let net_client_audio = net_client_ref.clone();
+        thread::Builder::new()
+            .name("audio-encoder-publisher".to_string())
+            .spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let mut a_encoder = LowLatencyAudioEncoder::new(my_id_audio);
+                    while !stop_audio_enc.load(Ordering::Relaxed) {
+                        if let Ok((pid, pcm_samples)) =
+                            audio_pcm_rx.recv_timeout(Duration::from_millis(10))
+                        {
+                            let packet = a_encoder.encode_pcm_frame(pid, &pcm_samples);
+                            if let Some(ref tx) = net_client_audio {
+                                tx.send_audio(packet);
+                            }
+                            while let Ok((next_pid, next_pcm)) = audio_pcm_rx.try_recv() {
+                                let pkt = a_encoder.encode_pcm_frame(next_pid, &next_pcm);
+                                if let Some(ref tx) = net_client_audio {
+                                    tx.send_audio(pkt);
+                                }
+                            }
+                        }
+                    }
+                }));
+            })
+            .ok();
+
         thread::Builder::new()
             .name("media-encoder-publisher".to_string())
             .spawn(move || {
@@ -311,18 +340,11 @@ impl ScreenShareApp {
                         viewer_congested,
                         kbps_atomic,
                     );
-                    let mut a_encoder = LowLatencyAudioEncoder::new(my_id.clone());
+                    let mut preview_div: u32 = 0;
 
                     while !stop_clone.load(Ordering::Relaxed) {
-                        while let Ok((pid, pcm_samples)) = audio_pcm_rx.try_recv() {
-                            let packet = a_encoder.encode_pcm_frame(pid, &pcm_samples);
-                            if let Some(ref tx) = net_client_ref {
-                                tx.send_audio(packet);
-                            }
-                        }
-
-                        // Aguardar evento de vídeo com wakeup instantâneo (< 0.01ms) sem cair no sleep de 15.6ms do Windows
-                        let first_ev = match cap_rx.recv_timeout(Duration::from_millis(2)) {
+                        // Aguardar evento de vídeo com wakeup instantâneo (< 0.01ms)
+                        let first_ev = match cap_rx.recv_timeout(Duration::from_millis(4)) {
                             Ok(ev) => Some(ev),
                             Err(_) => None,
                         };
@@ -359,8 +381,25 @@ impl ScreenShareApp {
                             bgra,
                         }) = latest_cap
                         {
-                            // Só gera buffer RGBA de self-preview se o usuário estiver vendo a própria tela
-                            if want_preview.load(Ordering::Relaxed) {
+                            if let Some(ref tx) = net_client_ref {
+                                v_encoder.notify_network_pressure(
+                                    tx.queue_len(),
+                                    rtt_atomic.load(Ordering::Relaxed) as u64,
+                                );
+
+                                // Pipeline paralelo: enquanto o socket TCP descarrega o frame N, a CPU já codifica o frame N+1!
+                                if !tx.is_video_busy() {
+                                    if let Some(pkt) =
+                                        v_encoder.encode_bgra_frame(width, height, &bgra)
+                                    {
+                                        let _ = tx.send_video(pkt);
+                                    }
+                                }
+                            }
+
+                            // Prévia local a 30 FPS (1 a cada 2 frames) para não roubar largura de banda de memória do encoder 60 FPS
+                            preview_div = preview_div.wrapping_add(1);
+                            if want_preview.load(Ordering::Relaxed) && (preview_div & 1 == 0) {
                                 let mut rgba = vec![255u8; bgra.len()];
                                 rgba.par_chunks_exact_mut(4)
                                     .zip(bgra.par_chunks_exact(4))
@@ -375,23 +414,6 @@ impl ScreenShareApp {
                                     hw_encoder_name: v_encoder.hw_encoder_name().to_string(),
                                     rgba,
                                 });
-                            }
-
-                            if let Some(ref tx) = net_client_ref {
-                                v_encoder.notify_network_pressure(
-                                    tx.queue_len(),
-                                    rtt_atomic.load(Ordering::Relaxed) as u64,
-                                );
-
-                                // Se o socket de saída ainda estiver enviando o frame anterior, não codifica frame intermediário:
-                                // isso preserva `prev_bgra` sincronizado com o último frame enviado e evita bandas faltando!
-                                if !tx.is_video_busy() {
-                                    if let Some(pkt) =
-                                        v_encoder.encode_bgra_frame(width, height, &bgra)
-                                    {
-                                        let _ = tx.send_video(pkt);
-                                    }
-                                }
                             }
                         }
                     }
@@ -640,7 +662,7 @@ impl ScreenShareApp {
                                 ui.add_space(6.0);
                             }
                             ui.label(
-                                RichText::new("Janjanator")
+                                RichText::new(format!("Janjanator {}", APP_VERSION))
                                     .font(FontId::proportional(26.0))
                                     .strong()
                                     .color(Color32::from_rgb(248, 113, 113)),
@@ -709,12 +731,19 @@ impl ScreenShareApp {
 
                         let updating = self.is_updating_app.load(Ordering::Relaxed);
                         let tag_label = self.latest_github_tag.lock().clone();
+                        let already_latest =
+                            !tag_label.is_empty() && !is_remote_tag_newer(&tag_label, APP_VERSION);
                         let btn_text = if updating {
-                            "⏳ Baixando atualização do GitHub...".to_string()
+                            "⏳ Verificando / Baixando atualização no GitHub...".to_string()
+                        } else if already_latest {
+                            format!("✔ Versão Atual ({}) — Já está na última versão", APP_VERSION)
                         } else if !tag_label.is_empty() {
-                            format!("🔄 Atualizar App (GitHub Release {})", tag_label)
+                            format!(
+                                "🔄 Atualizar App ({} ➡ {})",
+                                APP_VERSION, tag_label
+                            )
                         } else {
-                            "🔄 Atualizar App (GitHub Latest Release)".to_string()
+                            format!("🔄 Verificar Atualização (Versão atual: {})", APP_VERSION)
                         };
 
                         if ui
@@ -724,7 +753,11 @@ impl ScreenShareApp {
                                     RichText::new(btn_text)
                                         .size(13.0)
                                         .strong()
-                                        .color(Color32::from_rgb(209, 213, 219)),
+                                        .color(if already_latest {
+                                            Color32::from_rgb(52, 211, 153)
+                                        } else {
+                                            Color32::from_rgb(209, 213, 219)
+                                        }),
                                 )
                                 .fill(Color32::from_rgb(30, 36, 50))
                                 .rounding(Rounding::same(8.0))
@@ -779,7 +812,7 @@ impl ScreenShareApp {
                         ui.add_space(4.0);
                     }
                     ui.label(
-                        RichText::new("Janjanator")
+                        RichText::new(format!("Janjanator {}", APP_VERSION))
                             .size(16.5)
                             .strong()
                             .color(Color32::from_rgb(248, 113, 113)),
@@ -835,21 +868,33 @@ impl ScreenShareApp {
                         ui.add_space(6.0);
 
                         let updating = self.is_updating_app.load(Ordering::Relaxed);
+                        let tag_label = self.latest_github_tag.lock().clone();
+                        let already_latest =
+                            !tag_label.is_empty() && !is_remote_tag_newer(&tag_label, APP_VERSION);
+                        let top_upd_text = if updating {
+                            "⏳ Verificando...".to_string()
+                        } else if already_latest {
+                            format!("✔ Atualizado ({})", APP_VERSION)
+                        } else if !tag_label.is_empty() {
+                            format!("🔄 Atualizar ({})", tag_label)
+                        } else {
+                            "🔄 Atualizar App".to_string()
+                        };
+
                         if ui
                             .add_enabled(
                                 !updating,
                                 egui::Button::new(
-                                    RichText::new(if updating {
-                                        "⏳ Atualizando..."
+                                    RichText::new(top_upd_text).color(if already_latest {
+                                        Color32::from_rgb(52, 211, 153)
                                     } else {
-                                        "🔄 Atualizar App"
-                                    })
-                                    .color(Color32::from_rgb(209, 213, 219)),
+                                        Color32::from_rgb(209, 213, 219)
+                                    }),
                                 )
                                 .fill(Color32::from_rgb(30, 36, 50)),
                             )
                             .on_hover_text(
-                                "Baixa a versão mais recente (Latest Release) do GitHub e reinicia o Janjanator automaticamente",
+                                "Verifica se há uma nova Release no GitHub; se você já estiver na última versão, avisa sem reiniciar",
                             )
                             .clicked()
                         {
@@ -1648,13 +1693,38 @@ impl ScreenShareApp {
         let (tx, rx) = crossbeam_channel::bounded::<String>(16);
         self.update_status_rx = Some(rx);
         let updating_flag = self.is_updating_app.clone();
+        let latest_tag_cache = self.latest_github_tag.clone();
 
         thread::Builder::new()
             .name("github-self-updater".to_string())
             .spawn(move || {
-                run_github_self_update(tx, updating_flag);
+                run_github_self_update(tx, updating_flag, latest_tag_cache);
             })
             .ok();
+    }
+}
+
+fn parse_version_tuple(tag: &str) -> Option<(u32, u32, u32)> {
+    let cleaned = tag.trim().trim_start_matches('v').trim_start_matches('V');
+    let mut parts = cleaned.split(|c: char| !c.is_ascii_digit());
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let patch = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+fn is_remote_tag_newer(remote_tag: &str, local_version: &str) -> bool {
+    let r_norm = remote_tag.trim().trim_start_matches(['v', 'V']);
+    let l_norm = local_version.trim().trim_start_matches(['v', 'V']);
+    if r_norm.is_empty() || r_norm.eq_ignore_ascii_case("latest") {
+        return false;
+    }
+    if r_norm.eq_ignore_ascii_case(l_norm) {
+        return false;
+    }
+    match (parse_version_tuple(remote_tag), parse_version_tuple(local_version)) {
+        (Some(r), Some(l)) => r > l,
+        _ => true,
     }
 }
 
@@ -1698,7 +1768,11 @@ fn spawn_github_latest_tag_check(tag_out: Arc<parking_lot::Mutex<String>>) {
 }
 
 /// Baixa o `.exe` mais recente da aba Releases (`MatheusPalhares/Janjanator`), substitui o executável atual em execução e reinicia.
-fn run_github_self_update(status_tx: Sender<String>, updating_flag: Arc<AtomicBool>) {
+fn run_github_self_update(
+    status_tx: Sender<String>,
+    updating_flag: Arc<AtomicBool>,
+    latest_tag_cache: Arc<parking_lot::Mutex<String>>,
+) {
     let _ = status_tx.send("🔍 Verificando última versão no GitHub Releases...".to_string());
 
     let Ok(current_exe) = std::env::current_exe() else {
@@ -1707,11 +1781,11 @@ fn run_github_self_update(status_tx: Sender<String>, updating_flag: Arc<AtomicBo
         return;
     };
 
-    // 1. Descobrir a URL do asset .exe na última release via API do GitHub
+    // 1. Descobrir a tag e a URL do asset .exe na última release via API do GitHub
     let mut download_url =
         "https://github.com/MatheusPalhares/Janjanator/releases/latest/download/Janjanator.exe"
             .to_string();
-    let mut release_tag = "latest".to_string();
+    let mut release_tag = String::new();
 
     let mut api_cmd = std::process::Command::new("curl.exe");
     api_cmd.args([
@@ -1732,7 +1806,8 @@ fn run_github_self_update(status_tx: Sender<String>, updating_flag: Arc<AtomicBo
         if output.status.success() {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                 if let Some(tag) = json.get("tag_name").and_then(|v| v.as_str()) {
-                    release_tag = tag.to_string();
+                    release_tag = tag.trim().to_string();
+                    *latest_tag_cache.lock() = release_tag.clone();
                 }
                 if let Some(assets) = json.get("assets").and_then(|v| v.as_array()) {
                     for asset in assets {
@@ -1751,9 +1826,25 @@ fn run_github_self_update(status_tx: Sender<String>, updating_flag: Arc<AtomicBo
         }
     }
 
+    // Se a tag da última Release no GitHub for igual ou anterior à versão atual do app, não baixa nem cria .exe.old!
+    if !release_tag.is_empty() && !is_remote_tag_newer(&release_tag, APP_VERSION) {
+        let _ = status_tx.send(format!(
+            "✅ Você já está na última versão! (Instalada: {} | GitHub: {})",
+            APP_VERSION, release_tag
+        ));
+        updating_flag.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    let display_tag = if release_tag.is_empty() {
+        "latest"
+    } else {
+        release_tag.as_str()
+    };
+
     let _ = status_tx.send(format!(
         "⬇ Baixando Janjanator ({}) direto do GitHub...",
-        release_tag
+        display_tag
     ));
 
     let new_exe_path = current_exe.with_extension("exe.new");
@@ -1782,10 +1873,11 @@ fn run_github_self_update(status_tx: Sender<String>, updating_flag: Arc<AtomicBo
         .map(|s| s.success())
         .unwrap_or(false);
 
-    let valid_pe = match std::fs::read(&new_exe_path) {
-        Ok(bytes) => bytes.len() > 1_000_000 && bytes.starts_with(b"MZ"),
-        Err(_) => false,
-    };
+    let new_bytes_opt = std::fs::read(&new_exe_path).ok();
+    let valid_pe = new_bytes_opt
+        .as_ref()
+        .map(|bytes| bytes.len() > 1_000_000 && bytes.starts_with(b"MZ"))
+        .unwrap_or(false);
 
     if !dl_ok || !valid_pe {
         let _ = std::fs::remove_file(&new_exe_path);
@@ -1795,6 +1887,20 @@ fn run_github_self_update(status_tx: Sender<String>, updating_flag: Arc<AtomicBo
         );
         updating_flag.store(false, Ordering::SeqCst);
         return;
+    }
+
+    // Caso a API tenha sofrido rate-limit mas o binário baixado seja idêntico ao atual, não cria .old nem reinicia!
+    if let (Ok(cur_bytes), Some(new_bytes)) = (std::fs::read(&current_exe), new_bytes_opt.as_ref())
+    {
+        if &cur_bytes == new_bytes {
+            let _ = std::fs::remove_file(&new_exe_path);
+            let _ = status_tx.send(format!(
+                "✅ Você já está na última versão! ({})",
+                APP_VERSION
+            ));
+            updating_flag.store(false, Ordering::SeqCst);
+            return;
+        }
     }
 
     // 2. No Windows, um .exe em execução pode ser renomeado para .old e substituído pelo novo!

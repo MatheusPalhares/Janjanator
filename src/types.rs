@@ -2,6 +2,11 @@ use std::io::{Cursor, Read, Write};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 
+pub const APP_VERSION: &str = match option_env!("JANJANATOR_BUILD_VERSION") {
+    Some(v) => v,
+    None => "v0.3.0",
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolutionPreset {
     Res720p,
@@ -95,10 +100,10 @@ impl BitratePreset {
 
     pub fn initial_quality(&self) -> u8 {
         match self {
-            BitratePreset::AutoAdaptive => 68,
-            BitratePreset::Medium6Mbps => 56,
-            BitratePreset::High12Mbps => 70,
-            BitratePreset::Ultra25Mbps => 82,
+            BitratePreset::AutoAdaptive => 82,
+            BitratePreset::Medium6Mbps => 72,
+            BitratePreset::High12Mbps => 84,
+            BitratePreset::Ultra25Mbps => 92,
         }
     }
 

@@ -23,7 +23,7 @@ use windows::Win32::{
     System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED},
 };
 
-const NUM_PARALLEL_BANDS: usize = 8;
+const NUM_PARALLEL_BANDS: usize = 16;
 
 /// 2.2. Detecta o codificador de hardware H.264/AV1 disponível na GPU do Windows 11 via Media Foundation (`MFTEnumEx`).
 pub fn detect_hardware_video_encoder() -> String {
@@ -160,33 +160,33 @@ impl LowLatencyVideoEncoder {
 
     /// Ajusta dinamicamente a qualidade conforme folga de rede, RTT e feedback de congestionamento do espectador (ZeroTier).
     pub fn notify_network_pressure(&mut self, queue_len: usize, rtt_ms: u64) {
+        let (min_q, max_q) = match self.bitrate_preset {
+            BitratePreset::AutoAdaptive => (64, 86),
+            BitratePreset::Medium6Mbps => (64, 75),
+            BitratePreset::High12Mbps => (74, 88),
+            BitratePreset::Ultra25Mbps => (84, 94),
+        };
+
         let congested_remote = self.viewer_congested.swap(false, Ordering::Relaxed);
         if congested_remote {
-            // O SFU avisou que o socket do espectador (ex.: amigo no ZeroTier) engargalou:
-            // reduz qualidade imediatamente e força refresh limpo para não picotar bandas delta.
-            self.adaptive_quality = self.adaptive_quality.saturating_sub(7).max(38);
+            // O SFU avisou que o socket do espectador descartou um pacote antigo:
+            // reduz suavemente a qualidade mantendo nitidez alta (nunca cai para 38/40)
+            // e deixa o Rolling Band Refresh (16 faixas) recompor sem explodir o link com Keyframe gigante.
+            self.adaptive_quality = self.adaptive_quality.saturating_sub(3).max(min_q);
             self.stable_frames_count = 0;
-            self.force_keyframe.store(true, Ordering::Relaxed);
             return;
         }
 
-        if queue_len > 1 || rtt_ms > 160 {
-            self.adaptive_quality = self.adaptive_quality.saturating_sub(4).max(40);
+        if queue_len > 1 || rtt_ms > 180 {
+            self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(min_q);
             self.stable_frames_count = 0;
-        } else if queue_len == 1 || rtt_ms > 95 {
-            self.adaptive_quality = self.adaptive_quality.saturating_sub(1).max(46);
+        } else if rtt_ms > 120 {
+            self.adaptive_quality = self.adaptive_quality.saturating_sub(1).max(min_q + 2);
             self.stable_frames_count = 0;
         } else {
             self.stable_frames_count += 1;
-            // Sobe apenas 1 ponto a cada 30 frames estáveis (~0.5s), evitando explosão de bitrate no localhost
-            if self.stable_frames_count >= 30 {
+            if self.stable_frames_count >= 20 {
                 self.stable_frames_count = 0;
-                let max_q = match self.bitrate_preset {
-                    BitratePreset::AutoAdaptive => 74,
-                    BitratePreset::Medium6Mbps => 62,
-                    BitratePreset::High12Mbps => 74,
-                    BitratePreset::Ultra25Mbps => 84,
-                };
                 if self.adaptive_quality < max_q {
                     self.adaptive_quality += 1;
                 }
@@ -307,13 +307,8 @@ impl LowLatencyVideoEncoder {
             let _ = raw_payload.write_all(&jpeg_bytes);
         }
 
-        // Ajuste fino por tempo de CPU e teto de bitrate da opção selecionada
-        let encode_ms = encode_start.elapsed().as_millis();
-        if encode_ms > 10 {
-            self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(40);
-        }
-
-        // Medir bitrate real enviado na janela de 0.5s e manter dentro do orçamento para não gerar delay no ZeroTier
+        // Medir bitrate real enviado na janela de 0.5s e manter dentro do orçamento sem esmagar a nitidez
+        let _ = encode_start;
         self.bytes_in_window += raw_payload.len() as u64;
         let elapsed_sec = self.window_start.elapsed().as_secs_f64();
         if elapsed_sec >= 0.5 {
@@ -322,14 +317,14 @@ impl LowLatencyVideoEncoder {
             self.bytes_in_window = 0;
             self.window_start = Instant::now();
 
-            let target_max_kbps = match self.bitrate_preset {
-                BitratePreset::AutoAdaptive => 7_500, // 7.5 Mbps ideal para ZeroTier 60 FPS sem fila TCP
-                BitratePreset::Medium6Mbps => 6_000,
-                BitratePreset::High12Mbps => 12_000,
-                BitratePreset::Ultra25Mbps => 25_000,
+            let (target_max_kbps, min_q) = match self.bitrate_preset {
+                BitratePreset::AutoAdaptive => (15_000, 64),
+                BitratePreset::Medium6Mbps => (7_000, 64),
+                BitratePreset::High12Mbps => (14_000, 74),
+                BitratePreset::Ultra25Mbps => (28_000, 84),
             };
             if kbps > target_max_kbps {
-                self.adaptive_quality = self.adaptive_quality.saturating_sub(3).max(38);
+                self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(min_q);
             }
         }
 

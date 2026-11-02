@@ -191,7 +191,8 @@ pub struct MediaPublisherHandle {
 
 impl MediaPublisherHandle {
     pub fn is_video_busy(&self) -> bool {
-        self.video_tx.is_full() || self.socket_busy.load(Ordering::Relaxed)
+        // Permite codificar o próximo frame na CPU em paralelo enquanto o socket TCP envia o frame anterior!
+        self.video_tx.is_full()
     }
 
     pub fn queue_len(&self) -> usize {
@@ -236,10 +237,11 @@ impl RoomNetworkClient {
         server_ip_input: &str,
         local_participant: ParticipantInfo,
         event_tx: Sender<NetworkEvent>,
+        audio_pcm_tx: Sender<Vec<i16>>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<OutgoingCommand>(32);
-        let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(48);
-        // Fila de saída de vídeo com apenas 1 slot para NUNCA acumular atraso no cliente
+        let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+        // Fila de saída de vídeo com 1 slot para pipeline paralelo CPU (encode N+1) + Rede (envio N)
         let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
         let socket_busy = Arc::new(AtomicBool::new(false));
         let socket_busy_clone = socket_busy.clone();
@@ -261,6 +263,7 @@ impl RoomNetworkClient {
                         video_rx,
                         socket_busy_clone,
                         event_tx,
+                        audio_pcm_tx,
                         stop_clone,
                     );
                 }));
@@ -360,6 +363,7 @@ fn run_network_worker(
     video_rx: Receiver<Vec<u8>>,
     socket_busy: Arc<AtomicBool>,
     event_tx: Sender<NetworkEvent>,
+    audio_pcm_tx: Sender<Vec<i16>>,
     stop_flag: Arc<AtomicBool>,
 ) {
     let jwt_token = generate_livekit_jwt(
@@ -618,8 +622,8 @@ fn run_network_worker(
                                 if let Some(pkt) = EncodedAudioPacket::from_wire_bytes(&data) {
                                     if watched_host.as_deref() == Some(pkt.sender.as_str()) {
                                         if let Some(samples) = decode_audio_packet(&pkt) {
-                                            let _ = event_tx
-                                                .try_send(NetworkEvent::RemoteAudioFrame { samples });
+                                            // Envia direto da thread de rede para a thread de áudio WASAPI (sem passar pela GUI!)
+                                            let _ = audio_pcm_tx.try_send(samples);
                                         }
                                     }
                                 }
@@ -791,8 +795,8 @@ fn handle_embedded_peer(
     let _ = ws.get_ref().set_nonblocking(true);
 
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
-    let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
-    let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
+    let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(96);
+    let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
     let mut my_id: Option<String> = None;
     let mut pending_flush = false;
 
@@ -875,7 +879,7 @@ fn handle_embedded_peer(
                                                 let _ = peer.video_rx.try_recv();
                                                 let _ = peer.video_tx.try_send(data.clone());
                                                 if peer.last_congestion_notify.elapsed()
-                                                    >= Duration::from_millis(120)
+                                                    >= Duration::from_millis(350)
                                                 {
                                                     peer.last_congestion_notify = Instant::now();
                                                     notify_congested_host = host_ctrl_tx.clone();

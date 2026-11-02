@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Versão da Release (ex: v0.2.0)"
+        description: "Versão da Release (ex: v0.3.0)"
         required: false
-        default: "v0.2.0"
+        default: "v0.3.0"
 
 permissions:
   contents: write
@@ -41,6 +41,8 @@ jobs:
 
       - name: Build Optimized Single Executable (--release)
         shell: pwsh
+        env:
+          JANJANATOR_BUILD_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.3.0' }}
         run: |
           if (Test-Path "img/janjanator.res") {
             cargo rustc --release --bin screenshare-win11 -- -C link-arg=img/janjanator.res
@@ -70,8 +72,8 @@ jobs:
       - name: Publish GitHub Release (Private Repo)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.2.0' }}
-          name: "Janjanator ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.2.0' }}"
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.3.0' }}
+          name: "Janjanator ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.3.0' }}"
           body: |
             ## ⭐ Janjanator — Executável Portátil (Windows 11)
             

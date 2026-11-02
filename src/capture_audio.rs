@@ -287,7 +287,7 @@ unsafe fn run_process_loopback_capture(
         .Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             flags,
-            400_000,
+            1_000_000,
             0,
             &wave_format,
             None,
@@ -313,7 +313,7 @@ unsafe fn run_process_loopback_capture(
     while !stop_flag.load(Ordering::Relaxed) {
         let mut packet_length = capture_client.GetNextPacketSize().unwrap_or(0);
         if packet_length == 0 {
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(2));
             continue;
         }
 
@@ -446,12 +446,12 @@ unsafe fn run_audio_playback_loop(
     };
 
     let flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    // Buffer compartilhado de 120ms (1_200_000 hns) para absorver jitter do ZeroTier sem engasgos
+    // Buffer compartilhado de 200ms (2_000_000 hns) para absorver bursts de TCP no ZeroTier sem picotar
     if audio_client
         .Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             flags,
-            1_200_000,
+            2_000_000,
             0,
             &wave_format,
             None,
@@ -462,7 +462,7 @@ unsafe fn run_audio_playback_loop(
         return;
     }
 
-    let buffer_frame_count = audio_client.GetBufferSize().unwrap_or(5760);
+    let buffer_frame_count = audio_client.GetBufferSize().unwrap_or(9600);
     let Ok(render_client) = audio_client.GetService::<IAudioRenderClient>() else {
         CoUninitialize();
         return;
@@ -474,28 +474,42 @@ unsafe fn run_audio_playback_loop(
     };
 
     while !stop_flag.load(Ordering::Relaxed) {
-        let Ok(mut samples) = pcm_rx.recv_timeout(Duration::from_millis(25)) else {
+        let Ok(samples) = pcm_rx.recv_timeout(Duration::from_millis(25)) else {
             continue;
         };
 
-        // Anti-Delay: se acumulou mais de 5 pacotes (100ms) por oscilação de rede, descartar antigos para manter sincronia em tempo real
-        if pcm_rx.len() > 5 {
-            while pcm_rx.len() > 2 {
-                if let Ok(newer) = pcm_rx.try_recv() {
-                    samples = newer;
-                } else {
-                    break;
-                }
-            }
+        // Só descarta 1 pacote se o atraso acumulado passar de ~440ms (22 pacotes de 20ms).
+        // NUNCA descartar em rajadas normais de 3~8 pacotes do ZeroTier (isso causava o efeito chirping/picotado!).
+        if pcm_rx.len() > 22 {
+            let _ = pcm_rx.try_recv();
         }
 
         let vol = volume_pct.load(Ordering::Relaxed) as f32 / 100.0;
         let ch = AUDIO_CHANNELS as usize;
+
+        // Colchão Anti-Jitter de 40ms (1920 frames estéreo): se o buffer de hardware secou (início da stream
+        // ou após silêncio longo), injeta 40ms de colchão silencioso antes do pacote atual para que o ponteiro
+        // de leitura da placa de som fique sempre 40~60ms atrás dos pacotes que chegam via ZeroTier.
+        let initial_padding = audio_client.GetCurrentPadding().unwrap_or(0);
+        if initial_padding == 0 {
+            let cushion_frames = 1920u32.min(buffer_frame_count / 3);
+            if cushion_frames > 0 {
+                if let Ok(buf_ptr) = render_client.GetBuffer(cushion_frames) {
+                    let cushion_slice = std::slice::from_raw_parts_mut(
+                        buf_ptr as *mut i16,
+                        (cushion_frames as usize) * ch,
+                    );
+                    cushion_slice.fill(0);
+                    let _ = render_client.ReleaseBuffer(cushion_frames, 0);
+                }
+            }
+        }
+
         let total_frames = (samples.len() / ch) as u32;
         let mut written_frames = 0u32;
         let mut retries = 0u8;
 
-        while written_frames < total_frames && retries < 8 && !stop_flag.load(Ordering::Relaxed) {
+        while written_frames < total_frames && retries < 12 && !stop_flag.load(Ordering::Relaxed) {
             let padding = audio_client.GetCurrentPadding().unwrap_or(0);
             let available = buffer_frame_count.saturating_sub(padding);
             let remaining = total_frames - written_frames;

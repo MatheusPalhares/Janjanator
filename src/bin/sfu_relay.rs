@@ -206,9 +206,9 @@ fn handle_peer_connection(
     let _ = ws.get_ref().set_nonblocking(true);
 
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
-    let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
-    // Fila de vídeo de 1 único slot: impede fisicamente acumular 10 segundos de atraso no SFU
-    let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
+    let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(96);
+    // Micro-buffer de 4 frames (~66ms) para absorver bursts de ACK do ZeroTier sem descartar deltas nem atrasar a live
+    let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
     let mut my_id: Option<String> = None;
     let mut pending_flush = false;
 
@@ -298,12 +298,12 @@ fn handle_peer_connection(
                                     for peer in map.values_mut() {
                                         if peer.watching.as_deref() == Some(sender_id) {
                                             if peer.video_tx.try_send(data.clone()).is_err() {
-                                                // O link ZeroTier do espectador ainda não terminou o frame anterior:
-                                                // substitui pelo frame mais novo (Zero-Lag) e avisa o Host para ajustar bitrate/keyframe!
+                                                // O link ZeroTier do espectador acumulou >4 frames:
+                                                // substitui o mais antigo pelo mais novo (Zero-Lag) e avisa o Host!
                                                 let _ = peer.video_rx.try_recv();
                                                 let _ = peer.video_tx.try_send(data.clone());
                                                 if peer.last_congestion_notify.elapsed()
-                                                    >= Duration::from_millis(120)
+                                                    >= Duration::from_millis(350)
                                                 {
                                                     peer.last_congestion_notify = Instant::now();
                                                     notify_congested_host = host_ctrl_tx.clone();

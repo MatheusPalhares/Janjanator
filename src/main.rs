@@ -13,13 +13,34 @@ use ui::ScreenShareApp;
 
 const JANJANATOR_ICON_RGBA: &[u8] = include_bytes!("../img/janjanator_icon_64.rgba");
 
+#[cfg(windows)]
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(uPeriod: u32) -> u32;
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Limpar binário antigo (.old) caso o app tenha acabado de se auto-atualizar
+    // Ativar precisão de timer de 1ms no kernel do Windows (evita o sleep padrão de 15.6ms que derruba 60 FPS para 30~40 FPS)
+    #[cfg(windows)]
+    unsafe {
+        let _ = timeBeginPeriod(1);
+    }
+
+    // Limpar binário antigo (.exe.old / .exe.new) com retentativas caso o processo anterior ainda esteja encerrando no kernel
     if let Ok(exe_path) = std::env::current_exe() {
-        let old_path = exe_path.with_extension("exe.old");
-        let _ = std::fs::remove_file(old_path);
+        std::thread::spawn(move || {
+            let old_path = exe_path.with_extension("exe.old");
+            let new_path = exe_path.with_extension("exe.new");
+            for _ in 0..8 {
+                let _ = std::fs::remove_file(&new_path);
+                if !old_path.exists() || std::fs::remove_file(&old_path).is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        });
     }
 
     // Configurar Per-Monitor DPI Awareness no Windows 11 para captura em resolução real (Nativo/1080p)
@@ -40,9 +61,10 @@ fn main() -> eframe::Result<()> {
         height: 64,
     };
 
+    let window_title = format!("Janjanator {}", types::APP_VERSION);
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Janjanator")
+            .with_title(window_title)
             .with_icon(Arc::new(icon_data))
             .with_inner_size([1180.0, 720.0])
             .with_min_inner_size([860.0, 540.0]),
