@@ -68,6 +68,19 @@ Se quiser deixar o servidor rodando 24/7 em background (e também compilar o `Ja
 
 ---
 
+## 🛡️ Avisos do Windows (SmartScreen e Firewall) — Por que aparecem?
+
+Ao abrir o **`Janjanator.exe`** pela primeira vez, o Windows exibirá dois avisos padrões. **Isso é totalmente normal em projetos Open Source independentes:**
+
+1. **Tela Azul do Windows SmartScreen (*"O Windows protegeu o computador"*):**
+   - **Por que acontece:** A Microsoft exige um certificado digital comercial pago (que custa centenas de dólares por ano) para que um `.exe` baixado da internet seja reconhecido automaticamente. Como o **Janjanator** é um projeto gratuito, independente e de código 100% aberto, ele ainda não possui assinatura digital comercial.
+   - **Como abrir:** Clique em **"Mais informações"** e depois no botão **"Executar assim mesmo"**.
+2. **Alerta do Firewall do Windows (*"O Windows Defender Firewall bloqueou alguns recursos deste aplicativo"*):**
+   - **Por que acontece:** O `Janjanator.exe` traz um mini-servidor SFU embutido que abre a **porta TCP `7890`** localmente para permitir que você ou qualquer amigo possa hostear uma sala sem precisar instalar nada extra. Por abrir a porta `7890` para conexão P2P na VLAN, o Windows pede sua confirmação.
+   - **Como autorizar:** Marque as duas caixinhas (**Redes privadas** e **Redes públicas**) e clique em **"Permitir acesso"**.
+
+---
+
 ## 🛠️ Compilação Manual (Desenvolvedores)
 
 Caso queira compilar o binário localmente no Windows 11 com Rust instalado:

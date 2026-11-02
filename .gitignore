@@ -5,10 +5,12 @@
 
 # Environment files with local secrets (keep .env.example versioned)
 .env.local
+.env
 
 # OS / IDE files
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+roadmap.md
 
