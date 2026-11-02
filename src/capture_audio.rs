@@ -446,11 +446,12 @@ unsafe fn run_audio_playback_loop(
     };
 
     let flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    // Buffer compartilhado de 120ms (1_200_000 hns) para absorver jitter do ZeroTier sem engasgos
     if audio_client
         .Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             flags,
-            800_000,
+            1_200_000,
             0,
             &wave_format,
             None,
@@ -461,7 +462,7 @@ unsafe fn run_audio_playback_loop(
         return;
     }
 
-    let buffer_frame_count = audio_client.GetBufferSize().unwrap_or(4800);
+    let buffer_frame_count = audio_client.GetBufferSize().unwrap_or(5760);
     let Ok(render_client) = audio_client.GetService::<IAudioRenderClient>() else {
         CoUninitialize();
         return;
@@ -473,27 +474,49 @@ unsafe fn run_audio_playback_loop(
     };
 
     while !stop_flag.load(Ordering::Relaxed) {
-        let Ok(samples) = pcm_rx.recv_timeout(Duration::from_millis(25)) else {
+        let Ok(mut samples) = pcm_rx.recv_timeout(Duration::from_millis(25)) else {
             continue;
         };
 
-        let vol = volume_pct.load(Ordering::Relaxed) as f32 / 100.0;
-        let frames_to_write = (samples.len() / (AUDIO_CHANNELS as usize)) as u32;
-        let padding = audio_client.GetCurrentPadding().unwrap_or(0);
-        let available = buffer_frame_count.saturating_sub(padding);
-        let count = frames_to_write.min(available);
-
-        if count > 0 {
-            if let Ok(buf_ptr) = render_client.GetBuffer(count) {
-                let out_slice = std::slice::from_raw_parts_mut(
-                    buf_ptr as *mut i16,
-                    (count as usize) * (AUDIO_CHANNELS as usize),
-                );
-                for (dst, &src) in out_slice.iter_mut().zip(samples.iter()) {
-                    let scaled = (src as f32 * vol).clamp(-32768.0, 32767.0) as i16;
-                    *dst = scaled;
+        // Anti-Delay: se acumulou mais de 5 pacotes (100ms) por oscilação de rede, descartar antigos para manter sincronia em tempo real
+        if pcm_rx.len() > 5 {
+            while pcm_rx.len() > 2 {
+                if let Ok(newer) = pcm_rx.try_recv() {
+                    samples = newer;
+                } else {
+                    break;
                 }
-                let _ = render_client.ReleaseBuffer(count, 0);
+            }
+        }
+
+        let vol = volume_pct.load(Ordering::Relaxed) as f32 / 100.0;
+        let ch = AUDIO_CHANNELS as usize;
+        let total_frames = (samples.len() / ch) as u32;
+        let mut written_frames = 0u32;
+        let mut retries = 0u8;
+
+        while written_frames < total_frames && retries < 8 && !stop_flag.load(Ordering::Relaxed) {
+            let padding = audio_client.GetCurrentPadding().unwrap_or(0);
+            let available = buffer_frame_count.saturating_sub(padding);
+            let remaining = total_frames - written_frames;
+            let count = remaining.min(available);
+
+            if count > 0 {
+                if let Ok(buf_ptr) = render_client.GetBuffer(count) {
+                    let out_slice =
+                        std::slice::from_raw_parts_mut(buf_ptr as *mut i16, (count as usize) * ch);
+                    let src_start = (written_frames as usize) * ch;
+                    let src_end = src_start + (count as usize) * ch;
+                    for (dst, &src) in out_slice.iter_mut().zip(samples[src_start..src_end].iter())
+                    {
+                        *dst = (src as f32 * vol).clamp(-32768.0, 32767.0) as i16;
+                    }
+                    let _ = render_client.ReleaseBuffer(count, 0);
+                }
+                written_frames += count;
+            } else {
+                retries += 1;
+                thread::sleep(Duration::from_millis(2));
             }
         }
     }

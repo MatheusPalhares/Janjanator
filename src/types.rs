@@ -95,10 +95,10 @@ impl BitratePreset {
 
     pub fn initial_quality(&self) -> u8 {
         match self {
-            BitratePreset::AutoAdaptive => 84,
-            BitratePreset::Medium6Mbps => 68,
-            BitratePreset::High12Mbps => 80,
-            BitratePreset::Ultra25Mbps => 90,
+            BitratePreset::AutoAdaptive => 68,
+            BitratePreset::Medium6Mbps => 56,
+            BitratePreset::High12Mbps => 70,
+            BitratePreset::Ultra25Mbps => 82,
         }
     }
 

@@ -57,6 +57,7 @@ pub struct ScreenShareApp {
     audio_capture: Option<ProcessAudioCaptureSession>,
     publish_stop_flag: Option<Arc<AtomicBool>>,
     force_keyframe_flag: Arc<AtomicBool>,
+    viewer_congested_flag: Arc<AtomicBool>,
     local_preview_rx: Option<Receiver<DecodedVideoFrame>>,
     show_self_preview: bool,
     want_self_preview_atomic: Arc<AtomicBool>,
@@ -129,6 +130,7 @@ impl ScreenShareApp {
             audio_capture: None,
             publish_stop_flag: None,
             force_keyframe_flag: Arc::new(AtomicBool::new(true)),
+            viewer_congested_flag: Arc::new(AtomicBool::new(false)),
             local_preview_rx: None,
             show_self_preview: true,
             want_self_preview_atomic: Arc::new(AtomicBool::new(true)),
@@ -266,6 +268,8 @@ impl ScreenShareApp {
         let stop_clone = stop_flag.clone();
         let force_idr = self.force_keyframe_flag.clone();
         force_idr.store(true, Ordering::SeqCst);
+        let viewer_congested = self.viewer_congested_flag.clone();
+        viewer_congested.store(false, Ordering::SeqCst);
 
         let my_id = self.my_identity.clone();
         let bitrate = self.selected_bitrate;
@@ -282,24 +286,27 @@ impl ScreenShareApp {
                         my_id.clone(),
                         bitrate,
                         force_idr,
+                        viewer_congested,
                         kbps_atomic,
                     );
                     let mut a_encoder = LowLatencyAudioEncoder::new(my_id.clone());
 
                     while !stop_clone.load(Ordering::Relaxed) {
-                        let mut active = false;
-
                         while let Ok((pid, pcm_samples)) = audio_pcm_rx.try_recv() {
-                            active = true;
                             let packet = a_encoder.encode_pcm_frame(pid, &pcm_samples);
                             if let Some(ref tx) = net_client_ref {
-                                let _ = tx.try_send(OutgoingCommand::PublishAudio(packet));
+                                tx.send_audio(packet);
                             }
                         }
 
-                        // Drenar para pegar sempre o frame mais recente capturado
+                        // Aguardar evento de vídeo com wakeup instantâneo (< 0.01ms) sem cair no sleep de 15.6ms do Windows
+                        let first_ev = match cap_rx.recv_timeout(Duration::from_millis(2)) {
+                            Ok(ev) => Some(ev),
+                            Err(_) => None,
+                        };
+
                         let mut latest_cap = None;
-                        while let Ok(ev) = cap_rx.try_recv() {
+                        if let Some(ev) = first_ev {
                             match ev {
                                 CaptureEvent::FrameCaptured { .. } => {
                                     latest_cap = Some(ev);
@@ -310,6 +317,18 @@ impl ScreenShareApp {
                                 }
                                 _ => {}
                             }
+                            while let Ok(newer_ev) = cap_rx.try_recv() {
+                                match newer_ev {
+                                    CaptureEvent::FrameCaptured { .. } => {
+                                        latest_cap = Some(newer_ev);
+                                    }
+                                    CaptureEvent::TargetClosed => {
+                                        stop_clone.store(true, Ordering::SeqCst);
+                                        return;
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
 
                         if let Some(CaptureEvent::FrameCaptured {
@@ -318,8 +337,6 @@ impl ScreenShareApp {
                             bgra,
                         }) = latest_cap
                         {
-                            active = true;
-
                             // Só gera buffer RGBA de self-preview se o usuário estiver vendo a própria tela
                             if want_preview.load(Ordering::Relaxed) {
                                 let mut rgba = vec![255u8; bgra.len()];
@@ -338,22 +355,22 @@ impl ScreenShareApp {
                                 });
                             }
 
-                            if let Some( ref tx) = net_client_ref {
+                            if let Some(ref tx) = net_client_ref {
                                 v_encoder.notify_network_pressure(
-                                    tx.len(),
+                                    tx.queue_len(),
                                     rtt_atomic.load(Ordering::Relaxed) as u64,
                                 );
-                            }
 
-                            if let Some(pkt) = v_encoder.encode_bgra_frame(width, height, &bgra) {
-                                if let Some(ref tx) = net_client_ref {
-                                    let _ = tx.try_send(OutgoingCommand::PublishVideo(pkt));
+                                // Se o socket de saída ainda estiver enviando o frame anterior, não codifica frame intermediário:
+                                // isso preserva `prev_bgra` sincronizado com o último frame enviado e evita bandas faltando!
+                                if !tx.is_video_busy() {
+                                    if let Some(pkt) =
+                                        v_encoder.encode_bgra_frame(width, height, &bgra)
+                                    {
+                                        let _ = tx.send_video(pkt);
+                                    }
                                 }
                             }
-                        }
-
-                        if !active {
-                            thread::sleep(Duration::from_millis(1));
                         }
                     }
                 }));
@@ -487,6 +504,9 @@ impl ScreenShareApp {
                 }
                 NetworkEvent::KeyframeRequested => {
                     self.force_keyframe_flag.store(true, Ordering::SeqCst);
+                }
+                NetworkEvent::ViewerCongested => {
+                    self.viewer_congested_flag.store(true, Ordering::SeqCst);
                 }
                 NetworkEvent::LatencyUpdatedMs(rtt) => {
                     self.latency_ms = rtt;

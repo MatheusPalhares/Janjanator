@@ -4,9 +4,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tungstenite::protocol::WebSocket;
@@ -47,6 +47,9 @@ pub enum SfuControlMessage {
         viewer_identity: String,
     },
     RequestKeyframe {
+        target_host_identity: String,
+    },
+    ViewerCongested {
         target_host_identity: String,
     },
     Ping(u64),
@@ -93,7 +96,10 @@ struct ClientPeer {
     info: ParticipantInfo,
     watching: Option<String>,
     ctrl_tx: Sender<Vec<u8>>,
-    media_tx: Sender<Vec<u8>>,
+    audio_tx: Sender<Vec<u8>>,
+    video_tx: Sender<Vec<u8>>,
+    video_rx: Receiver<Vec<u8>>,
+    last_congestion_notify: Instant,
 }
 
 fn broadcast_room_state(peers: &Arc<Mutex<HashMap<String, ClientPeer>>>) {
@@ -106,15 +112,24 @@ fn broadcast_room_state(peers: &Arc<Mutex<HashMap<String, ClientPeer>>>) {
     }
 }
 
-fn send_ws_resilient(socket: &mut WebSocket<TcpStream>, data: Vec<u8>) -> bool {
+/// Envia uma mensagem WebSocket com controle estrito de `pending_flush` para impedir
+/// que o `write_buffer` interno do `tungstenite` acumule múltiplos frames em conexões ZeroTier.
+fn send_ws_gated(
+    socket: &mut WebSocket<TcpStream>,
+    data: Vec<u8>,
+    pending_flush: &mut bool,
+) -> bool {
     match socket.send(Message::Binary(data)) {
-        Ok(()) => true,
+        Ok(()) => {
+            *pending_flush = false;
+            true
+        }
         Err(tungstenite::Error::Io(ref err))
             if err.kind() == ErrorKind::WouldBlock
                 || err.kind() == ErrorKind::TimedOut
                 || err.kind() == ErrorKind::Interrupted =>
         {
-            let _ = socket.flush();
+            *pending_flush = true;
             true
         }
         Err(_) => false,
@@ -128,15 +143,29 @@ fn main() {
     println!("  - HTTP Portal & Download  : 0.0.0.0:7888                    ");
     println!("=============================================================");
 
-    if let Ok(bytes) = fs::read("/app/screenshare-win11.exe") {
-        let _ = fs::create_dir_all("/dist");
-        if fs::write("/dist/screenshare-win11.exe", &bytes).is_ok() {
-            println!(
-                "[OK] Executável Windows 11 exportado para ./dist/screenshare-win11.exe ({:.2} MB)",
-                bytes.len() as f64 / (1024.0 * 1024.0)
-            );
+    thread::spawn(|| {
+        if let Ok(bytes) = fs::read("/app/screenshare-win11.exe") {
+            let _ = fs::create_dir_all("/dist");
+            loop {
+                let needs_update = match fs::read("/dist/screenshare-win11.exe") {
+                    Ok(existing) => existing != bytes,
+                    Err(_) => true,
+                };
+                if needs_update {
+                    if fs::write("/dist/screenshare-win11.exe", &bytes).is_ok() {
+                        println!(
+                            "[OK] Executável Windows 11 exportado para ./dist/screenshare-win11.exe ({:.2} MB)",
+                            bytes.len() as f64 / (1024.0 * 1024.0)
+                        );
+                        break;
+                    }
+                } else {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(2));
+            }
         }
-    }
+    });
 
     let peers: Arc<Mutex<HashMap<String, ClientPeer>>> = Arc::new(Mutex::new(HashMap::new()));
     let peers_http = peers.clone();
@@ -176,31 +205,67 @@ fn handle_peer_connection(
     let _ = ws.get_ref().set_nonblocking(true);
 
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
-    let (media_tx, media_rx) = crossbeam_channel::bounded::<Vec<u8>>(48);
+    let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+    // Fila de vídeo de 1 único slot: impede fisicamente acumular 10 segundos de atraso no SFU
+    let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
     let mut my_id: Option<String> = None;
+    let mut pending_flush = false;
 
     loop {
         let mut active = false;
 
-        while let Ok(bin) = ctrl_rx.try_recv() {
-            active = true;
-            if !send_ws_resilient(&mut ws, bin) {
-                break;
+        // 1. Se o socket estava com flush pendente (WouldBlock), tentar descarregar antes de colocar mais dados no buffer do tungstenite
+        if pending_flush {
+            match ws.flush() {
+                Ok(()) => {
+                    pending_flush = false;
+                    active = true;
+                }
+                Err(tungstenite::Error::Io(ref err))
+                    if err.kind() == ErrorKind::WouldBlock
+                        || err.kind() == ErrorKind::TimedOut
+                        || err.kind() == ErrorKind::Interrupted =>
+                {
+                    // Socket TCP ainda enviando o pacote anterior; não empilhar novos pacotes
+                }
+                Err(_) => break,
             }
         }
 
-        let mut media_sent = 0;
-        while media_sent < 12 {
-            let Ok(bin) = media_rx.try_recv() else {
-                break;
-            };
-            active = true;
-            media_sent += 1;
-            if !send_ws_resilient(&mut ws, bin) {
-                break;
+        // 2. Só enviar novos pacotes quando o buffer do WebSocket estiver livre (!pending_flush)
+        // Prioridade 1: Controle | Prioridade 2: Áudio (nunca picota!) | Prioridade 3: Vídeo (1 frame mais recente)
+        if !pending_flush {
+            while !pending_flush {
+                let Ok(bin) = ctrl_rx.try_recv() else {
+                    break;
+                };
+                active = true;
+                if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
+                    return;
+                }
+            }
+
+            while !pending_flush {
+                let Ok(bin) = audio_rx.try_recv() else {
+                    break;
+                };
+                active = true;
+                if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
+                    return;
+                }
+            }
+
+            if !pending_flush {
+                if let Ok(bin) = video_rx.try_recv() {
+                    active = true;
+                    if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
+                        return;
+                    }
+                }
             }
         }
 
+        // 3. Ler pacotes recebidos (Full-Duplex)
         for _ in 0..16 {
             match ws.read() {
                 Ok(Message::Binary(data)) => {
@@ -209,12 +274,50 @@ fn handle_peer_connection(
                         continue;
                     }
                     match data[0] {
-                        WIRE_TAG_VIDEO_BINARY | WIRE_TAG_AUDIO_BINARY => {
+                        WIRE_TAG_AUDIO_BINARY => {
                             if let Some(sender_id) = peek_binary_packet_sender(&data) {
                                 let map = peers_ref.lock();
                                 for peer in map.values() {
                                     if peer.watching.as_deref() == Some(sender_id) {
-                                        let _ = peer.media_tx.try_send(data.clone());
+                                        // Se a fila de áudio do espectador encher por pico extremo, descarta o mais antigo
+                                        if peer.audio_tx.try_send(data.clone()).is_err() {
+                                            let _ = peer.audio_tx.try_send(data.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        WIRE_TAG_VIDEO_BINARY => {
+                            if let Some(sender_id) = peek_binary_packet_sender(&data) {
+                                let mut notify_congested_host: Option<Sender<Vec<u8>>> = None;
+                                {
+                                    let mut map = peers_ref.lock();
+                                    let host_ctrl_tx =
+                                        map.get(sender_id).map(|h| h.ctrl_tx.clone());
+                                    for peer in map.values_mut() {
+                                        if peer.watching.as_deref() == Some(sender_id) {
+                                            if peer.video_tx.try_send(data.clone()).is_err() {
+                                                // O link ZeroTier do espectador ainda não terminou o frame anterior:
+                                                // substitui pelo frame mais novo (Zero-Lag) e avisa o Host para ajustar bitrate/keyframe!
+                                                let _ = peer.video_rx.try_recv();
+                                                let _ = peer.video_tx.try_send(data.clone());
+                                                if peer.last_congestion_notify.elapsed()
+                                                    >= Duration::from_millis(120)
+                                                {
+                                                    peer.last_congestion_notify = Instant::now();
+                                                    notify_congested_host = host_ctrl_tx.clone();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(tx) = notify_congested_host {
+                                    if let Some(msg) = (SfuControlMessage::ViewerCongested {
+                                        target_host_identity: sender_id.to_string(),
+                                    })
+                                    .to_wire_bytes()
+                                    {
+                                        let _ = tx.try_send(msg);
                                     }
                                 }
                             }
@@ -242,7 +345,10 @@ fn handle_peer_connection(
                                                     info: participant,
                                                     watching: prev_watching,
                                                     ctrl_tx: ctrl_tx.clone(),
-                                                    media_tx: media_tx.clone(),
+                                                    audio_tx: audio_tx.clone(),
+                                                    video_tx: video_tx.clone(),
+                                                    video_rx: video_rx.clone(),
+                                                    last_congestion_notify: Instant::now(),
                                                 },
                                             );
                                         }
@@ -326,10 +432,8 @@ fn handle_peer_connection(
             }
         }
 
-        let _ = ws.flush();
-
         if !active {
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_micros(400));
         }
     }
 }
@@ -350,8 +454,8 @@ fn handle_http_request(
     let first_line = req.lines().next().unwrap_or("");
 
     if first_line.starts_with("GET /download/screenshare-win11.exe") {
-        if let Ok(exe_bytes) = fs::read("/dist/screenshare-win11.exe")
-            .or_else(|_| fs::read("/app/screenshare-win11.exe"))
+        if let Ok(exe_bytes) = fs::read("/app/screenshare-win11.exe")
+            .or_else(|_| fs::read("/dist/screenshare-win11.exe"))
         {
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"screenshare-win11.exe\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

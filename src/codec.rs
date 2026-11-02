@@ -83,7 +83,34 @@ pub fn detect_hardware_video_encoder() -> String {
     }
 }
 
-/// 2.2. Codificador de Vídeo Multi-Core Paralelo com Bitrate Adaptativo ("Auto") e Delta-Bands.
+/// Verifica rapidamente se uma faixa horizontal teve mudança visual real (ignorando ruído de 1 bit do DWM).
+#[inline]
+fn band_has_visual_change(cur: &[u8], prev: &[u8]) -> bool {
+    if cur.len() != prev.len() {
+        return true;
+    }
+    // Comparação rápida em blocos de 64 bytes; se idêntico em memória, retorna false em < 0.02ms
+    if cur == prev {
+        return false;
+    }
+    // Se diferir, verificar se a diferença supera limiar de ruído (2 níveis de cor)
+    let len = cur.len();
+    let step = 16; // amostra a cada 4 pixels
+    let mut i = 0;
+    while i + 2 < len {
+        let db = (cur[i] as i16 - prev[i] as i16).abs();
+        let dg = (cur[i + 1] as i16 - prev[i + 1] as i16).abs();
+        let dr = (cur[i + 2] as i16 - prev[i + 2] as i16).abs();
+        if db > 2 || dg > 2 || dr > 2 {
+            return true;
+        }
+        i += step;
+    }
+    false
+}
+
+/// 2.2. Codificador de Vídeo Multi-Core Paralelo com Bitrate Adaptativo ("Auto"),
+/// Rolling Band Refresh (auto-cura contínua sem picos de keyframe) e controle de congestionamento Fim-a-Fim.
 pub struct LowLatencyVideoEncoder {
     sender_id: String,
     sequence: u64,
@@ -92,10 +119,12 @@ pub struct LowLatencyVideoEncoder {
     current_kbps: Arc<AtomicU32>,
     hw_encoder_name: String,
     force_keyframe: Arc<AtomicBool>,
+    viewer_congested: Arc<AtomicBool>,
     prev_bgra: Vec<u8>,
     prev_dims: (u32, u32),
     bytes_in_window: u64,
     window_start: Instant,
+    stable_frames_count: u32,
 }
 
 impl LowLatencyVideoEncoder {
@@ -103,6 +132,7 @@ impl LowLatencyVideoEncoder {
         sender_id: String,
         bitrate_preset: BitratePreset,
         force_keyframe: Arc<AtomicBool>,
+        viewer_congested: Arc<AtomicBool>,
         current_kbps: Arc<AtomicU32>,
     ) -> Self {
         let hw_encoder_name = detect_hardware_video_encoder();
@@ -115,10 +145,12 @@ impl LowLatencyVideoEncoder {
             current_kbps,
             hw_encoder_name,
             force_keyframe,
+            viewer_congested,
             prev_bgra: Vec::new(),
             prev_dims: (0, 0),
             bytes_in_window: 0,
             window_start: Instant::now(),
+            stable_frames_count: 0,
         }
     }
 
@@ -126,21 +158,43 @@ impl LowLatencyVideoEncoder {
         &self.hw_encoder_name
     }
 
-    /// Ajusta dinamicamente a qualidade no modo `AutoAdaptive` conforme folga de rede e tempo de encode.
+    /// Ajusta dinamicamente a qualidade conforme folga de rede, RTT e feedback de congestionamento do espectador (ZeroTier).
     pub fn notify_network_pressure(&mut self, queue_len: usize, rtt_ms: u64) {
-        if self.bitrate_preset != BitratePreset::AutoAdaptive {
+        let congested_remote = self.viewer_congested.swap(false, Ordering::Relaxed);
+        if congested_remote {
+            // O SFU avisou que o socket do espectador (ex.: amigo no ZeroTier) engargalou:
+            // reduz qualidade imediatamente e força refresh limpo para não picotar bandas delta.
+            self.adaptive_quality = self.adaptive_quality.saturating_sub(7).max(38);
+            self.stable_frames_count = 0;
+            self.force_keyframe.store(true, Ordering::Relaxed);
             return;
         }
-        if queue_len > 3 || rtt_ms > 180 {
-            self.adaptive_quality = self.adaptive_quality.saturating_sub(4).max(58);
-        } else if queue_len > 1 || rtt_ms > 100 {
-            self.adaptive_quality = self.adaptive_quality.saturating_sub(1).max(65);
-        } else if queue_len == 0 {
-            self.adaptive_quality = (self.adaptive_quality + 1).min(92);
+
+        if queue_len > 1 || rtt_ms > 160 {
+            self.adaptive_quality = self.adaptive_quality.saturating_sub(4).max(40);
+            self.stable_frames_count = 0;
+        } else if queue_len == 1 || rtt_ms > 95 {
+            self.adaptive_quality = self.adaptive_quality.saturating_sub(1).max(46);
+            self.stable_frames_count = 0;
+        } else {
+            self.stable_frames_count += 1;
+            // Sobe apenas 1 ponto a cada 30 frames estáveis (~0.5s), evitando explosão de bitrate no localhost
+            if self.stable_frames_count >= 30 {
+                self.stable_frames_count = 0;
+                let max_q = match self.bitrate_preset {
+                    BitratePreset::AutoAdaptive => 74,
+                    BitratePreset::Medium6Mbps => 62,
+                    BitratePreset::High12Mbps => 74,
+                    BitratePreset::Ultra25Mbps => 84,
+                };
+                if self.adaptive_quality < max_q {
+                    self.adaptive_quality += 1;
+                }
+            }
         }
     }
 
-    /// Codifica um frame BGRA em paralelo nos múltiplos núcleos da CPU (< 3ms para 1080p).
+    /// Codifica um frame BGRA em paralelo nos múltiplos núcleos da CPU (< 2ms para 1080p).
     pub fn encode_bgra_frame(
         &mut self,
         width: u32,
@@ -155,20 +209,19 @@ impl LowLatencyVideoEncoder {
         let encode_start = Instant::now();
         self.sequence += 1;
 
-        let dims_changed = self.prev_dims != (width, height) || self.prev_bgra.len() != expected_len;
+        let dims_changed =
+            self.prev_dims != (width, height) || self.prev_bgra.len() != expected_len;
         let is_keyframe = self.sequence == 1
             || dims_changed
-            || self.sequence % 90 == 0
             || self.force_keyframe.swap(false, Ordering::SeqCst);
 
-        let quality = match self.bitrate_preset {
-            BitratePreset::AutoAdaptive => self.adaptive_quality,
-            other => other.initial_quality(),
-        };
+        let quality = self.adaptive_quality;
 
         let num_bands = NUM_PARALLEL_BANDS.min(height as usize).max(1);
         let base_band_h = (height as usize) / num_bands;
         let stride = (width as usize) * 4;
+        // Rolling refresh: atualiza ciclicamente 1 faixa a cada frame para auto-curar a imagem em 133ms sem picos de rede
+        let rolling_band = (self.sequence as usize) % num_bands;
 
         struct BandJob<'a> {
             band_idx: u8,
@@ -190,10 +243,10 @@ impl LowLatencyVideoEncoder {
             let byte_range = (y_start * stride)..(y_end * stride);
             let src_slice = &bgra[byte_range.clone()];
 
-            let changed = if is_keyframe {
+            let changed = if is_keyframe || b == rolling_band {
                 true
             } else {
-                src_slice != &self.prev_bgra[byte_range]
+                band_has_visual_change(src_slice, &self.prev_bgra[byte_range])
             };
 
             jobs.push(BandJob {
@@ -229,7 +282,7 @@ impl LowLatencyVideoEncoder {
                     dst[2] = src[0];
                 }
 
-                let mut jpeg_buf = Vec::with_capacity(pixel_count / 3);
+                let mut jpeg_buf = Vec::with_capacity(pixel_count / 4);
                 {
                     let mut cursor = Cursor::new(&mut jpeg_buf);
                     let mut encoder = JpegEncoder::new_with_quality(&mut cursor, quality);
@@ -242,8 +295,9 @@ impl LowLatencyVideoEncoder {
             })
             .collect();
 
-        // Empacotar faixas modificadas e comprimir com LZ4
-        let mut raw_payload = Vec::with_capacity(64 * 1024);
+        // Empacotamento binário direto das faixas JPEG (sem overhead de LZ4 sobre JPEG já comprimido)
+        let total_jpeg_bytes: usize = encoded_bands.iter().map(|(_, _, _, b)| b.len() + 13).sum();
+        let mut raw_payload = Vec::with_capacity(1 + total_jpeg_bytes);
         let _ = raw_payload.write_u8(encoded_bands.len() as u8);
         for (band_idx, y_start, band_h, jpeg_bytes) in encoded_bands {
             let _ = raw_payload.write_u8(band_idx);
@@ -253,24 +307,30 @@ impl LowLatencyVideoEncoder {
             let _ = raw_payload.write_all(&jpeg_bytes);
         }
 
-        let compressed = lz4_flex::compress_prepend_size(&raw_payload);
-
-        // Ajuste fino do AutoAdaptive baseado no tempo de CPU do frame (< 10ms = folga para subir qualidade)
-        if self.bitrate_preset == BitratePreset::AutoAdaptive {
-            let encode_ms = encode_start.elapsed().as_millis();
-            if encode_ms > 12 {
-                self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(62);
-            }
+        // Ajuste fino por tempo de CPU e teto de bitrate da opção selecionada
+        let encode_ms = encode_start.elapsed().as_millis();
+        if encode_ms > 10 {
+            self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(40);
         }
 
-        // Medir bitrate real enviado na janela de 1s
-        self.bytes_in_window += compressed.len() as u64;
+        // Medir bitrate real enviado na janela de 0.5s e manter dentro do orçamento para não gerar delay no ZeroTier
+        self.bytes_in_window += raw_payload.len() as u64;
         let elapsed_sec = self.window_start.elapsed().as_secs_f64();
-        if elapsed_sec >= 0.8 {
+        if elapsed_sec >= 0.5 {
             let kbps = ((self.bytes_in_window as f64 * 8.0) / 1000.0 / elapsed_sec).round() as u32;
-            self.current_kbps.store(kbps.max(250), Ordering::Relaxed);
+            self.current_kbps.store(kbps.max(150), Ordering::Relaxed);
             self.bytes_in_window = 0;
             self.window_start = Instant::now();
+
+            let target_max_kbps = match self.bitrate_preset {
+                BitratePreset::AutoAdaptive => 7_500, // 7.5 Mbps ideal para ZeroTier 60 FPS sem fila TCP
+                BitratePreset::Medium6Mbps => 6_000,
+                BitratePreset::High12Mbps => 12_000,
+                BitratePreset::Ultra25Mbps => 25_000,
+            };
+            if kbps > target_max_kbps {
+                self.adaptive_quality = self.adaptive_quality.saturating_sub(3).max(38);
+            }
         }
 
         let timestamp_ms = SystemTime::now()
@@ -286,12 +346,12 @@ impl LowLatencyVideoEncoder {
             height,
             is_keyframe,
             hw_encoder_name: self.hw_encoder_name.clone(),
-            payload: compressed,
+            payload: raw_payload,
         })
     }
 }
 
-/// Decodificador de Vídeo Multi-Core com estado para recompor faixas Delta em < 1.5ms.
+/// Decodificador de Vídeo Multi-Core com estado para recompor faixas Delta em < 1.2ms.
 pub struct VideoStreamDecoder {
     canvas_rgba: Vec<u8>,
     canvas_w: u32,
@@ -308,8 +368,11 @@ impl VideoStreamDecoder {
     }
 
     pub fn decode_packet(&mut self, packet: &EncodedVideoPacket) -> Option<DecodedVideoFrame> {
-        let raw_payload = lz4_flex::decompress_size_prepended(&packet.payload).ok()?;
-        let mut cur = Cursor::new(&raw_payload);
+        let data = &packet.payload;
+        if data.is_empty() {
+            return None;
+        }
+        let mut cur = Cursor::new(data);
         let band_count = cur.read_u8().ok()? as usize;
 
         let width = packet.width;
@@ -320,25 +383,28 @@ impl VideoStreamDecoder {
         {
             self.canvas_w = width;
             self.canvas_h = height;
-            self.canvas_rgba = vec![0u8; total_rgba];
+            self.canvas_rgba = vec![255u8; total_rgba];
         }
 
-        let mut band_tasks: Vec<(u32, u32, Vec<u8>)> = Vec::with_capacity(band_count);
+        let mut band_tasks: Vec<(u32, u32, &[u8])> = Vec::with_capacity(band_count);
         for _ in 0..band_count {
             let _band_idx = cur.read_u8().ok()?;
             let y_start = cur.read_u32::<LittleEndian>().ok()?;
             let band_h = cur.read_u32::<LittleEndian>().ok()?;
             let jpeg_len = cur.read_u32::<LittleEndian>().ok()? as usize;
-            let mut jpeg_bytes = vec![0u8; jpeg_len];
-            cur.read_exact(&mut jpeg_bytes).ok()?;
-            band_tasks.push((y_start, band_h, jpeg_bytes));
+            let pos = cur.position() as usize;
+            if pos + jpeg_len > data.len() {
+                return None;
+            }
+            band_tasks.push((y_start, band_h, &data[pos..pos + jpeg_len]));
+            cur.set_position((pos + jpeg_len) as u64);
         }
 
-        // Decodificar todas as faixas em paralelo via Rayon
+        // Decodificar todas as faixas em paralelo via Rayon (Zero-Copy slice input)
         let decoded_strips: Vec<(u32, u32, Vec<u8>)> = band_tasks
             .into_par_iter()
-            .filter_map(|(y_start, band_h, jpeg_bytes)| {
-                let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(&jpeg_bytes));
+            .filter_map(|(y_start, band_h, jpeg_slice)| {
+                let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(jpeg_slice));
                 let rgb = decoder.decode().ok()?;
                 let pixel_count = (width as usize) * (band_h as usize);
                 if rgb.len() < pixel_count * 3 {

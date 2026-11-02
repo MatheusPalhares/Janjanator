@@ -507,7 +507,6 @@ fn run_capture_loop(
 
         let mut raw_bgra_buf: Vec<u8> = Vec::new();
         let mut last_scaled_cache: Option<(u32, u32, Vec<u8>)> = None;
-        let mut last_sent_instant = Instant::now();
         let mut next_tick = Instant::now();
 
         while !stop_flag.load(Ordering::Relaxed) {
@@ -537,9 +536,18 @@ fn run_capture_loop(
             let mut raw_dims = (0u32, 0u32);
 
             if let Some(ref mut engine) = wgc_engine {
-                if let Some((w, h)) = engine.try_grab_latest_frame(&mut raw_bgra_buf) {
-                    got_new_gpu_frame = true;
-                    raw_dims = (w, h);
+                // Tentar pegar o frame imediatamente; se o VSync do DWM estiver a ~1ms de distância, aguardar brevemente
+                let poll_deadline = Instant::now() + Duration::from_micros(2200);
+                loop {
+                    if let Some((w, h)) = engine.try_grab_latest_frame(&mut raw_bgra_buf) {
+                        got_new_gpu_frame = true;
+                        raw_dims = (w, h);
+                        break;
+                    }
+                    if Instant::now() >= poll_deadline {
+                        break;
+                    }
+                    thread::yield_now();
                 }
             } else if let Some((w, h, gdi_data)) = capture_fallback_gdi(&target) {
                 raw_bgra_buf = gdi_data;
@@ -557,36 +565,37 @@ fn run_capture_loop(
                 };
 
                 last_scaled_cache = Some((dst_w, dst_h, final_bgra.clone()));
-                last_sent_instant = Instant::now();
 
                 let _ = event_tx.try_send(CaptureEvent::FrameCaptured {
                     width: dst_w,
                     height: dst_h,
                     bgra: final_bgra,
                 });
-            } else if last_sent_instant.elapsed() >= Duration::from_millis(200) {
-                // Se a janela capturada está 100% estática (sem novos frames da GPU), envia keepalive leve
-                if let Some((dst_w, dst_h, ref cached)) = last_scaled_cache {
-                    last_sent_instant = Instant::now();
-                    let _ = event_tx.try_send(CaptureEvent::FrameCaptured {
-                        width: dst_w,
-                        height: dst_h,
-                        bgra: cached.clone(),
-                    });
-                }
+            } else if let Some((dst_w, dst_h, ref cached)) = last_scaled_cache {
+                // Mantém cadência constante de 30/60 FPS mesmo quando o DWM não redesenhou a janela no tick
+                let _ = event_tx.try_send(CaptureEvent::FrameCaptured {
+                    width: dst_w,
+                    height: dst_h,
+                    bgra: cached.clone(),
+                });
             }
 
             next_tick += frame_interval;
             let now = Instant::now();
             if next_tick > now {
                 let wait = next_tick - now;
-                if wait > Duration::from_millis(2) {
-                    thread::sleep(wait - Duration::from_millis(1));
+                // No Windows o timer padrão do kernel tem granularidade de 15.6ms;
+                // só usar thread::sleep se sobrar mais de 16ms (ex.: 30 FPS), e usar yield_now para precisão de 60 FPS
+                if wait > Duration::from_millis(16) {
+                    thread::sleep(wait - Duration::from_millis(15));
+                }
+                while Instant::now() + Duration::from_micros(800) < next_tick {
+                    thread::yield_now();
                 }
                 while Instant::now() < next_tick {
                     std::hint::spin_loop();
                 }
-            } else {
+            } else if now - next_tick > frame_interval {
                 next_tick = now;
             }
         }

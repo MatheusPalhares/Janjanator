@@ -25,11 +25,14 @@ RUN mkdir -p src/bin && \
 COPY src ./src
 
 # 1. Compilar o servidor Linux SFU Relay & Portal HTTP
-RUN touch src/main.rs src/bin/sfu_relay.rs && \
+RUN rm -f target/release/sfu_relay target/release/deps/sfu_relay* && \
+    touch src/*.rs src/bin/*.rs && \
     cargo build --release --bin sfu_relay
 
 # 2. Compilar o executável portátil nativo do Windows 11 (screenshare-win11.exe)
-RUN cargo build --release --target x86_64-pc-windows-gnu --bin screenshare-win11
+RUN rm -f target/x86_64-pc-windows-gnu/release/screenshare-win11.exe target/x86_64-pc-windows-gnu/release/deps/screenshare_win11* && \
+    touch src/*.rs && \
+    cargo build --release --target x86_64-pc-windows-gnu --bin screenshare-win11
 
 # ============================================================================
 # Stage 2: Imagem Runtime Leve (Servidor SFU Relay + Exportador do .exe)

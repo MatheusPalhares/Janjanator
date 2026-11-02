@@ -110,6 +110,9 @@ pub enum SfuControlMessage {
     RequestKeyframe {
         target_host_identity: String,
     },
+    ViewerCongested {
+        target_host_identity: String,
+    },
     Ping(u64),
     Pong(u64),
 }
@@ -166,6 +169,7 @@ pub enum NetworkEvent {
         samples: Vec<i16>,
     },
     KeyframeRequested,
+    ViewerCongested,
     LatencyUpdatedMs(u64),
 }
 
@@ -177,9 +181,53 @@ pub enum OutgoingCommand {
     Disconnect,
 }
 
-/// Cliente de rede Full-Duplex com reconexão automática e thread de decodificação isolada.
+#[derive(Clone)]
+pub struct MediaPublisherHandle {
+    cmd_tx: Sender<OutgoingCommand>,
+    audio_tx: Sender<Vec<u8>>,
+    video_tx: Sender<Vec<u8>>,
+    socket_busy: Arc<AtomicBool>,
+}
+
+impl MediaPublisherHandle {
+    pub fn is_video_busy(&self) -> bool {
+        self.video_tx.is_full() || self.socket_busy.load(Ordering::Relaxed)
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.video_tx.len() + usize::from(self.socket_busy.load(Ordering::Relaxed))
+    }
+
+    pub fn send_audio(&self, pkt: EncodedAudioPacket) {
+        let _ = self.audio_tx.try_send(pkt.to_wire_bytes());
+    }
+
+    pub fn send_video(&self, pkt: EncodedVideoPacket) -> bool {
+        self.video_tx.try_send(pkt.to_wire_bytes()).is_ok()
+    }
+
+    pub fn try_send(&self, cmd: OutgoingCommand) -> Result<(), ()> {
+        match cmd {
+            OutgoingCommand::PublishAudio(pkt) => {
+                self.send_audio(pkt);
+                Ok(())
+            }
+            OutgoingCommand::PublishVideo(pkt) => {
+                if self.send_video(pkt) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            other => self.cmd_tx.try_send(other).map_err(|_| ()),
+        }
+    }
+}
+
+/// Cliente de rede Full-Duplex com filas separadas de Áudio/Vídeo, Zero-Bufferbloat e thread de decodificação isolada.
 pub struct RoomNetworkClient {
     cmd_tx: Sender<OutgoingCommand>,
+    pub_handle: MediaPublisherHandle,
     stop_flag: Arc<AtomicBool>,
 }
 
@@ -189,7 +237,13 @@ impl RoomNetworkClient {
         local_participant: ParticipantInfo,
         event_tx: Sender<NetworkEvent>,
     ) -> Self {
-        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<OutgoingCommand>(64);
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<OutgoingCommand>(32);
+        let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(48);
+        // Fila de saída de vídeo com apenas 1 slot para NUNCA acumular atraso no cliente
+        let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
+        let socket_busy = Arc::new(AtomicBool::new(false));
+        let socket_busy_clone = socket_busy.clone();
+
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
         let (host_str, port) = parse_server_endpoint(server_ip_input);
@@ -203,6 +257,9 @@ impl RoomNetworkClient {
                         port,
                         local_participant,
                         cmd_rx,
+                        audio_rx,
+                        video_rx,
+                        socket_busy_clone,
                         event_tx,
                         stop_clone,
                     );
@@ -210,7 +267,18 @@ impl RoomNetworkClient {
             })
             .expect("Falha ao criar thread de rede SFU");
 
-        Self { cmd_tx, stop_flag }
+        let pub_handle = MediaPublisherHandle {
+            cmd_tx: cmd_tx.clone(),
+            audio_tx,
+            video_tx,
+            socket_busy,
+        };
+
+        Self {
+            cmd_tx,
+            pub_handle,
+            stop_flag,
+        }
     }
 
     pub fn update_participant(&self, info: ParticipantInfo) {
@@ -230,8 +298,8 @@ impl RoomNetworkClient {
         let _ = self.cmd_tx.try_send(OutgoingCommand::Disconnect);
     }
 
-    pub fn inner_sender(&self) -> Sender<OutgoingCommand> {
-        self.cmd_tx.clone()
+    pub fn inner_sender(&self) -> MediaPublisherHandle {
+        self.pub_handle.clone()
     }
 }
 
@@ -288,6 +356,9 @@ fn run_network_worker(
     port: u16,
     mut current_participant: ParticipantInfo,
     cmd_rx: Receiver<OutgoingCommand>,
+    audio_rx: Receiver<Vec<u8>>,
+    video_rx: Receiver<Vec<u8>>,
+    socket_busy: Arc<AtomicBool>,
     event_tx: Sender<NetworkEvent>,
     stop_flag: Arc<AtomicBool>,
 ) {
@@ -301,7 +372,7 @@ fn run_network_worker(
     let ws_url = format!("ws://{}:{}/ws", host, port);
 
     // Iniciar thread dedicada de decodificação de vídeo para NUNCA bloquear o socket TCP
-    let (vdec_tx, vdec_rx) = crossbeam_channel::bounded::<EncodedVideoPacket>(3);
+    let (vdec_tx, vdec_rx) = crossbeam_channel::bounded::<EncodedVideoPacket>(32);
     let event_tx_vdec = event_tx.clone();
     let stop_vdec = stop_flag.clone();
     thread::Builder::new()
@@ -313,14 +384,12 @@ fn run_network_worker(
                     let Ok(mut pkt) = vdec_rx.recv_timeout(Duration::from_millis(50)) else {
                         continue;
                     };
-                    // Se for keyframe mais recente na fila, pular frames intermediários mas processar todos os deltas em ordem
+                    // Processar todos os deltas acumulados em ordem no canvas e emitir o frame final atualizado
                     while let Ok(next_pkt) = vdec_rx.try_recv() {
                         if next_pkt.is_keyframe {
                             pkt = next_pkt;
                         } else {
-                            if let Some(frame) = decoder.decode_packet(&pkt) {
-                                let _ = event_tx_vdec.try_send(NetworkEvent::RemoteVideoFrame(frame));
-                            }
+                            let _ = decoder.decode_packet(&pkt);
                             pkt = next_pkt;
                         }
                     }
@@ -338,6 +407,7 @@ fn run_network_worker(
 
     // Loop com reconexão automática transparente caso a conexão oscile durante stream dupla
     while !stop_flag.load(Ordering::Relaxed) {
+        socket_busy.store(false, Ordering::Relaxed);
         let mut ws_conn = connect_ws_nonblocking(&ws_url);
         if ws_conn.is_none()
             && port == DEFAULT_SFU_RELAY_PORT
@@ -398,18 +468,39 @@ fn run_network_worker(
 
         let mut last_ping = Instant::now();
         let mut connection_alive = true;
+        let mut pending_flush = false;
 
         while connection_alive && !stop_flag.load(Ordering::Relaxed) {
             let mut did_work = false;
 
-            // 1. Enviar pacotes na fila de saída (limitando burst por ciclo para priorizar leitura full-duplex)
-            let mut sent_this_tick = 0;
-            while sent_this_tick < 8 {
+            // 1. Verificar se o write_buffer do WebSocket terminou de descarregar no socket TCP
+            if pending_flush {
+                match socket.flush() {
+                    Ok(()) => {
+                        pending_flush = false;
+                        socket_busy.store(false, Ordering::Relaxed);
+                        did_work = true;
+                    }
+                    Err(tungstenite::Error::Io(ref err))
+                        if err.kind() == ErrorKind::WouldBlock
+                            || err.kind() == ErrorKind::TimedOut
+                            || err.kind() == ErrorKind::Interrupted =>
+                    {
+                        socket_busy.store(true, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        connection_alive = false;
+                        break;
+                    }
+                }
+            }
+
+            // 2. Comandos de Controle
+            while !pending_flush {
                 let Ok(cmd) = cmd_rx.try_recv() else {
                     break;
                 };
                 did_work = true;
-                sent_this_tick += 1;
 
                 match cmd {
                     OutgoingCommand::UpdateLocalParticipant(info) => {
@@ -417,7 +508,7 @@ fn run_network_worker(
                         if let Some(bin) =
                             SfuControlMessage::UpdateParticipant(info).to_wire_bytes()
                         {
-                            if !send_ws_resilient(&mut socket, bin) {
+                            if !send_ws_gated(&mut socket, bin, &mut pending_flush) {
                                 connection_alive = false;
                                 break;
                             }
@@ -435,7 +526,7 @@ fn run_network_worker(
                             },
                         };
                         if let Some(bin) = ctrl.to_wire_bytes() {
-                            if !send_ws_resilient(&mut socket, bin) {
+                            if !send_ws_gated(&mut socket, bin, &mut pending_flush) {
                                 connection_alive = false;
                                 break;
                             }
@@ -443,14 +534,14 @@ fn run_network_worker(
                     }
                     OutgoingCommand::PublishVideo(packet) => {
                         let bin = packet.to_wire_bytes();
-                        if !send_ws_resilient(&mut socket, bin) {
+                        if !send_ws_gated(&mut socket, bin, &mut pending_flush) {
                             connection_alive = false;
                             break;
                         }
                     }
                     OutgoingCommand::PublishAudio(packet) => {
                         let bin = packet.to_wire_bytes();
-                        if !send_ws_resilient(&mut socket, bin) {
+                        if !send_ws_gated(&mut socket, bin, &mut pending_flush) {
                             connection_alive = false;
                             break;
                         }
@@ -466,20 +557,49 @@ fn run_network_worker(
                 break;
             }
 
-            // 2. Ping periódico a cada 2 segundos
-            if last_ping.elapsed() >= Duration::from_secs(2) {
+            // 3. Prioridade Estrita para Áudio de Saída (nunca espera atrás de vídeo)
+            while !pending_flush {
+                let Ok(audio_bin) = audio_rx.try_recv() else {
+                    break;
+                };
+                did_work = true;
+                if !send_ws_gated(&mut socket, audio_bin, &mut pending_flush) {
+                    connection_alive = false;
+                    break;
+                }
+            }
+
+            if !connection_alive {
+                break;
+            }
+
+            // 4. Vídeo de Saída (apenas 1 frame por vez quando o socket está 100% livre)
+            if !pending_flush {
+                if let Ok(video_bin) = video_rx.try_recv() {
+                    did_work = true;
+                    if !send_ws_gated(&mut socket, video_bin, &mut pending_flush) {
+                        connection_alive = false;
+                        break;
+                    }
+                }
+            }
+
+            socket_busy.store(pending_flush, Ordering::Relaxed);
+
+            // 5. Ping periódico a cada 2 segundos
+            if !pending_flush && last_ping.elapsed() >= Duration::from_secs(2) {
                 last_ping = Instant::now();
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
                 if let Some(bin) = SfuControlMessage::Ping(now_ms).to_wire_bytes() {
-                    let _ = send_ws_resilient(&mut socket, bin);
+                    let _ = send_ws_gated(&mut socket, bin, &mut pending_flush);
                 }
             }
 
-            // 3. Drenar todos os pacotes recebidos disponíveis no socket não-bloqueante
-            for _ in 0..16 {
+            // 6. Drenar todos os pacotes recebidos disponíveis no socket não-bloqueante
+            for _ in 0..24 {
                 match socket.read() {
                     Ok(Message::Binary(data)) => {
                         did_work = true;
@@ -520,6 +640,14 @@ fn run_network_worker(
                                                     event_tx.send(NetworkEvent::KeyframeRequested);
                                             }
                                         }
+                                        SfuControlMessage::ViewerCongested {
+                                            target_host_identity,
+                                        } => {
+                                            if target_host_identity == my_identity {
+                                                let _ =
+                                                    event_tx.send(NetworkEvent::ViewerCongested);
+                                            }
+                                        }
                                         SfuControlMessage::Pong(sent_ms) => {
                                             let now_ms = SystemTime::now()
                                                 .duration_since(UNIX_EPOCH)
@@ -555,25 +683,31 @@ fn run_network_worker(
                 }
             }
 
-            let _ = socket.flush();
-
             if !did_work {
-                thread::sleep(Duration::from_millis(1));
+                // Evitar thread::sleep(1ms) no Windows (que dorme 15.6ms e derruba o FPS para 30~40!)
+                thread::yield_now();
             }
         }
     }
 }
 
-/// Envia uma mensagem binária tratando `WouldBlock`/`TimedOut` sem derrubar a conexão TCP.
-fn send_ws_resilient(socket: &mut WebSocket<TcpStream>, data: Vec<u8>) -> bool {
+/// Envia uma mensagem binária com controle estrito de `pending_flush` para impedir bufferbloat.
+fn send_ws_gated(
+    socket: &mut WebSocket<TcpStream>,
+    data: Vec<u8>,
+    pending_flush: &mut bool,
+) -> bool {
     match socket.send(Message::Binary(data)) {
-        Ok(()) => true,
+        Ok(()) => {
+            *pending_flush = false;
+            true
+        }
         Err(tungstenite::Error::Io(ref err))
             if err.kind() == ErrorKind::WouldBlock
                 || err.kind() == ErrorKind::TimedOut
                 || err.kind() == ErrorKind::Interrupted =>
         {
-            let _ = socket.flush();
+            *pending_flush = true;
             true
         }
         Err(_) => false,
@@ -591,7 +725,6 @@ fn connect_ws_nonblocking(ws_url: &str) -> Option<WebSocket<TcpStream>> {
     let tcp = TcpStream::connect_timeout(&sock_addr, Duration::from_millis(3500)).ok()?;
     let _ = tcp.set_nodelay(true);
     let (socket, _resp) = tungstenite::client::client(ws_url, tcp).ok()?;
-    // Usar modo nonblocking após o handshake WebSocket para leitura/escrita full-duplex sem conflitos de timeout
     let _ = socket.get_ref().set_nonblocking(true);
     Some(socket)
 }
@@ -600,7 +733,10 @@ struct ClientPeer {
     info: ParticipantInfo,
     watching: Option<String>,
     ctrl_tx: Sender<Vec<u8>>,
-    media_tx: Sender<Vec<u8>>,
+    audio_tx: Sender<Vec<u8>>,
+    video_tx: Sender<Vec<u8>>,
+    video_rx: Receiver<Vec<u8>>,
+    last_congestion_notify: Instant,
 }
 
 fn broadcast_room_state(peers: &Arc<Mutex<HashMap<String, ClientPeer>>>) {
@@ -655,28 +791,56 @@ fn handle_embedded_peer(
     let _ = ws.get_ref().set_nonblocking(true);
 
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
-    let (media_tx, media_rx) = crossbeam_channel::bounded::<Vec<u8>>(48);
+    let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+    let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
     let mut my_id: Option<String> = None;
+    let mut pending_flush = false;
 
     loop {
         let mut active = false;
 
-        while let Ok(bin) = ctrl_rx.try_recv() {
-            active = true;
-            if !send_ws_resilient(&mut ws, bin) {
-                break;
+        if pending_flush {
+            match ws.flush() {
+                Ok(()) => {
+                    pending_flush = false;
+                    active = true;
+                }
+                Err(tungstenite::Error::Io(ref err))
+                    if err.kind() == ErrorKind::WouldBlock
+                        || err.kind() == ErrorKind::TimedOut
+                        || err.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
             }
         }
 
-        let mut media_sent = 0;
-        while media_sent < 12 {
-            let Ok(bin) = media_rx.try_recv() else {
-                break;
-            };
-            active = true;
-            media_sent += 1;
-            if !send_ws_resilient(&mut ws, bin) {
-                break;
+        if !pending_flush {
+            while !pending_flush {
+                let Ok(bin) = ctrl_rx.try_recv() else {
+                    break;
+                };
+                active = true;
+                if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
+                    return;
+                }
+            }
+
+            while !pending_flush {
+                let Ok(bin) = audio_rx.try_recv() else {
+                    break;
+                };
+                active = true;
+                if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
+                    return;
+                }
+            }
+
+            if !pending_flush {
+                if let Ok(bin) = video_rx.try_recv() {
+                    active = true;
+                    if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
+                        return;
+                    }
+                }
             }
         }
 
@@ -688,12 +852,45 @@ fn handle_embedded_peer(
                         continue;
                     }
                     match data[0] {
-                        WIRE_TAG_VIDEO_BINARY | WIRE_TAG_AUDIO_BINARY => {
+                        WIRE_TAG_AUDIO_BINARY => {
                             if let Some(sender_id) = peek_binary_packet_sender(&data) {
                                 let map = peers_ref.lock();
                                 for peer in map.values() {
                                     if peer.watching.as_deref() == Some(sender_id) {
-                                        let _ = peer.media_tx.try_send(data.clone());
+                                        let _ = peer.audio_tx.try_send(data.clone());
+                                    }
+                                }
+                            }
+                        }
+                        WIRE_TAG_VIDEO_BINARY => {
+                            if let Some(sender_id) = peek_binary_packet_sender(&data) {
+                                let mut notify_congested_host: Option<Sender<Vec<u8>>> = None;
+                                {
+                                    let mut map = peers_ref.lock();
+                                    let host_ctrl_tx =
+                                        map.get(sender_id).map(|h| h.ctrl_tx.clone());
+                                    for peer in map.values_mut() {
+                                        if peer.watching.as_deref() == Some(sender_id) {
+                                            if peer.video_tx.try_send(data.clone()).is_err() {
+                                                let _ = peer.video_rx.try_recv();
+                                                let _ = peer.video_tx.try_send(data.clone());
+                                                if peer.last_congestion_notify.elapsed()
+                                                    >= Duration::from_millis(120)
+                                                {
+                                                    peer.last_congestion_notify = Instant::now();
+                                                    notify_congested_host = host_ctrl_tx.clone();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(tx) = notify_congested_host {
+                                    if let Some(msg) = (SfuControlMessage::ViewerCongested {
+                                        target_host_identity: sender_id.to_string(),
+                                    })
+                                    .to_wire_bytes()
+                                    {
+                                        let _ = tx.try_send(msg);
                                     }
                                 }
                             }
@@ -717,7 +914,10 @@ fn handle_embedded_peer(
                                                     info: participant,
                                                     watching: prev_watching,
                                                     ctrl_tx: ctrl_tx.clone(),
-                                                    media_tx: media_tx.clone(),
+                                                    audio_tx: audio_tx.clone(),
+                                                    video_tx: video_tx.clone(),
+                                                    video_rx: video_rx.clone(),
+                                                    last_congestion_notify: Instant::now(),
                                                 },
                                             );
                                         }
@@ -799,10 +999,8 @@ fn handle_embedded_peer(
             }
         }
 
-        let _ = ws.flush();
-
         if !active {
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_micros(400));
         }
     }
 }
