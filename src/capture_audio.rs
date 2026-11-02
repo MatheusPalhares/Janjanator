@@ -1,3 +1,4 @@
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -74,7 +75,8 @@ impl Drop for ProcessAudioCaptureSession {
     }
 }
 
-/// Implementação COM manual e leve de `IActivateAudioInterfaceCompletionHandler` para `ActivateAudioInterfaceAsync`.
+/// Implementação COM segura de `IActivateAudioInterfaceCompletionHandler` para `ActivateAudioInterfaceAsync`.
+/// O `event_handle` só é fechado quando a última referência COM (`ref_count == 0`) é liberada pelo Windows.
 #[cfg(windows)]
 #[repr(C)]
 struct CompletionHandlerCom {
@@ -100,14 +102,14 @@ unsafe extern "system" fn completion_query_interface(
     riid: *const GUID,
     ppv: *mut *mut core::ffi::c_void,
 ) -> HRESULT {
-    if ppv.is_null() {
+    if ppv.is_null() || riid.is_null() {
         return E_NOINTERFACE;
     }
     let iid = &*riid;
+    // Suportar IActivateAudioInterfaceCompletionHandler, IUnknown e IAgileObject (exigido pelo WASAPI Async)
     if *iid == IActivateAudioInterfaceCompletionHandler::IID
         || *iid == windows::core::IUnknown::IID
-        || *iid
-            == GUID::from_u128(0x94ea2b94_e9cc_49e0_c0ff_ee64ca8f5b90) // IAgileObject
+        || *iid == GUID::from_u128(0x94ea2b94_e9cc_49e0_c0ff_ee64ca8f5b90)
     {
         *ppv = this;
         completion_add_ref(this);
@@ -129,7 +131,11 @@ unsafe extern "system" fn completion_release(this: *mut core::ffi::c_void) -> u3
     let obj = &*(this as *const CompletionHandlerCom);
     let prev = obj.ref_count.fetch_sub(1, Ordering::Release);
     if prev == 1 {
-        let _ = Box::from_raw(this as *mut CompletionHandlerCom);
+        std::sync::atomic::fence(Ordering::Acquire);
+        let boxed = Box::from_raw(this as *mut CompletionHandlerCom);
+        if !boxed.event_handle.is_invalid() {
+            let _ = CloseHandle(boxed.event_handle);
+        }
     }
     prev - 1
 }
@@ -140,11 +146,15 @@ unsafe extern "system" fn completion_activate_completed(
     _operation: *mut core::ffi::c_void,
 ) -> HRESULT {
     let obj = &*(this as *const CompletionHandlerCom);
-    let _ = SetEvent(obj.event_handle);
+    if !obj.event_handle.is_invalid() {
+        let _ = SetEvent(obj.event_handle);
+    }
     S_OK
 }
 
 /// 1.4. Ativa `IAudioClient` isolado para a árvore de processos do `target_pid` no Windows 11.
+/// Usa `ManuallyDrop<PROPVARIANT>` para evitar que `PropVariantClear` tente dar `CoTaskMemFree`
+/// no ponteiro da stack `&mut activation_params` (o que causava `STATUS_HEAP_CORRUPTION 0xC0000374`).
 #[cfg(windows)]
 unsafe fn activate_process_loopback_client(target_pid: u32) -> Option<IAudioClient> {
     if target_pid == 0 {
@@ -167,7 +177,6 @@ unsafe fn activate_process_loopback_client(target_pid: u32) -> Option<IAudioClie
         },
     };
 
-    // Configurar PROPVARIANT como VT_BLOB apontando para AUDIOCLIENT_ACTIVATION_PARAMS
     #[repr(C)]
     struct RawPropVariantBlob {
         vt: u16,
@@ -188,7 +197,10 @@ unsafe fn activate_process_loopback_client(target_pid: u32) -> Option<IAudioClie
         _pad: 0,
         p_blob_data: &mut activation_params as *mut _ as *mut u8,
     };
-    let prop_variant: PROPVARIANT = std::mem::transmute_copy(&raw_prop);
+
+    // CRÍTICO: Usar ManuallyDrop para impedir que o Drop do PROPVARIANT chame PropVariantClear/CoTaskMemFree na stack!
+    let prop_variant: ManuallyDrop<PROPVARIANT> =
+        ManuallyDrop::new(std::mem::transmute_copy(&raw_prop));
 
     let handler_box = Box::new(CompletionHandlerCom {
         vtbl: &COMPLETION_HANDLER_VTBL,
@@ -196,30 +208,26 @@ unsafe fn activate_process_loopback_client(target_pid: u32) -> Option<IAudioClie
         event_handle: event,
     });
     let handler_ptr = Box::into_raw(handler_box);
-    let handler: IActivateAudioInterfaceCompletionHandler =
-        std::mem::transmute(handler_ptr);
+    let handler: IActivateAudioInterfaceCompletionHandler = std::mem::transmute(handler_ptr);
 
-    // String oficial VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK = "VAD\\Process_Loopback"
     let device_id_utf16: Vec<u16> = "VAD\\Process_Loopback\0".encode_utf16().collect();
 
     let op_res: windows::core::Result<IActivateAudioInterfaceAsyncOperation> =
         ActivateAudioInterfaceAsync(
             PCWSTR(device_id_utf16.as_ptr()),
             &IAudioClient::IID,
-            Some(&prop_variant),
+            Some(&*prop_variant),
             &handler,
         );
 
     let operation = match op_res {
         Ok(op) => op,
         Err(_) => {
-            let _ = CloseHandle(event);
             return activate_desktop_loopback_client();
         }
     };
 
     WaitForSingleObject(event, 3000);
-    let _ = CloseHandle(event);
 
     let mut activate_hr = HRESULT::default();
     let mut activated_unk: Option<windows::core::IUnknown> = None;
@@ -261,7 +269,6 @@ unsafe fn run_process_loopback_capture(
         return;
     };
 
-    // Formato PCM 16-bit 48kHz Estéreo com auto-conversão do Windows Audio Engine
     let wave_format = WAVEFORMATEX {
         wFormatTag: 1, // WAVE_FORMAT_PCM
         nChannels: AUDIO_CHANNELS,
@@ -276,7 +283,6 @@ unsafe fn run_process_loopback_capture(
         | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
         | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 
-    // Buffer de 40ms em unidades de 100ns (400_000)
     if audio_client
         .Initialize(
             AUDCLNT_SHAREMODE_SHARED,
@@ -444,7 +450,7 @@ unsafe fn run_audio_playback_loop(
         .Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             flags,
-            800_000, // 80ms buffer
+            800_000,
             0,
             &wave_format,
             None,
@@ -453,7 +459,7 @@ unsafe fn run_audio_playback_loop(
     {
         CoUninitialize();
         return;
-    };
+    }
 
     let buffer_frame_count = audio_client.GetBufferSize().unwrap_or(4800);
     let Ok(render_client) = audio_client.GetService::<IAudioRenderClient>() else {
@@ -464,7 +470,7 @@ unsafe fn run_audio_playback_loop(
     if audio_client.Start().is_err() {
         CoUninitialize();
         return;
-    }
+    };
 
     while !stop_flag.load(Ordering::Relaxed) {
         let Ok(samples) = pcm_rx.recv_timeout(Duration::from_millis(25)) else {
@@ -495,4 +501,3 @@ unsafe fn run_audio_playback_loop(
     let _ = audio_client.Stop();
     CoUninitialize();
 }
-

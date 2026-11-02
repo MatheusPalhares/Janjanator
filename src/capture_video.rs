@@ -325,9 +325,11 @@ impl WgcEngine {
             }
         };
 
-        let size = item.Size()?;
-        let w = size.Width.max(64) as u32;
-        let h = size.Height.max(64) as u32;
+        let mut size = item.Size()?;
+        size.Width = size.Width.max(64);
+        size.Height = size.Height.max(64);
+        let w = size.Width as u32;
+        let h = size.Height as u32;
 
         // Buffer de 3 frames para permitir captura contínua a 60+ FPS sem stalls de GPU
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -377,28 +379,6 @@ impl WgcEngine {
             return None;
         }
 
-        // Recriar o frame pool se a janela mudou de tamanho
-        let cw = content_size.Width.max(64) as u32;
-        let ch = content_size.Height.max(64) as u32;
-        if cw != self.pool_w || ch != self.pool_h {
-            self.pool_w = cw;
-            self.pool_h = ch;
-            if let Ok(dxgi_device) = self.d3d_device.cast::<IDXGIDevice>() {
-                if let Ok(inspectable) = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) {
-                    if let Ok(winrt_dev) = inspectable
-                        .cast::<windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>()
-                    {
-                        let _ = self.frame_pool.Recreate(
-                            &winrt_dev,
-                            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                            3,
-                            content_size,
-                        );
-                    }
-                }
-            }
-        }
-
         // Reutilizar textura Staging na GPU (só recria se a resolução da textura mudou)
         if self.staging_tex.is_none()
             || self.staging_w != desc.Width
@@ -430,6 +410,9 @@ impl WgcEngine {
         };
 
         self.d3d_context.CopyResource(staging_tex, &texture);
+        drop(texture);
+        drop(access);
+        drop(surface);
         let _ = latest_frame.Close();
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -446,6 +429,11 @@ impl WgcEngine {
         let row_pitch = mapped.RowPitch as usize;
         let dst_row_bytes = (width as usize) * 4;
         let total_bytes = dst_row_bytes * (height as usize);
+
+        if mapped.pData.is_null() || row_pitch < dst_row_bytes {
+            self.d3d_context.Unmap(staging_tex, 0);
+            return None;
+        }
 
         if out_bgra.len() != total_bytes {
             out_bgra.resize(total_bytes, 0);
@@ -464,6 +452,32 @@ impl WgcEngine {
         }
 
         self.d3d_context.Unmap(staging_tex, 0);
+
+        // Recriar o frame pool se a janela mudou de tamanho (APÓS copiar e liberar a superfície D3D11 do frame atual!)
+        let mut safe_size = content_size;
+        safe_size.Width = safe_size.Width.max(64);
+        safe_size.Height = safe_size.Height.max(64);
+        let cw = safe_size.Width as u32;
+        let ch = safe_size.Height as u32;
+        if cw != self.pool_w || ch != self.pool_h {
+            self.pool_w = cw;
+            self.pool_h = ch;
+            if let Ok(dxgi_device) = self.d3d_device.cast::<IDXGIDevice>() {
+                if let Ok(inspectable) = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) {
+                    if let Ok(winrt_dev) = inspectable
+                        .cast::<windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>()
+                    {
+                        let _ = self.frame_pool.Recreate(
+                            &winrt_dev,
+                            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                            3,
+                            safe_size,
+                        );
+                    }
+                }
+            }
+        }
+
         Some((width, height))
     }
 }
@@ -485,6 +499,7 @@ fn run_capture_loop(
 ) {
     #[cfg(windows)]
     unsafe {
+        let _ = RoInitialize(RO_INIT_MULTITHREADED);
         let target_fps = fps.clamp(15, 120);
         let frame_interval = Duration::from_nanos(1_000_000_000 / target_fps as u64);
         let mut wgc_engine = WgcEngine::new(&target).ok();
