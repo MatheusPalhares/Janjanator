@@ -1,4 +1,4 @@
-name: Build & Publish Windows 11 Release (.exe)
+name: Build & Publish Janjanator Release (.exe)
 
 on:
   push:
@@ -7,16 +7,16 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Versão da Release (ex: v0.1.0)"
+        description: "Versão da Release (ex: v0.2.0)"
         required: false
-        default: "v0.1.0"
+        default: "v0.2.0"
 
 permissions:
   contents: write
 
 jobs:
   build-windows-exe:
-    name: Compile Portable Windows 11 .exe
+    name: Compile Portable Janjanator.exe
     runs-on: windows-latest
 
     steps:
@@ -31,8 +31,22 @@ jobs:
       - name: Rust Cargo Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Compile Win32 Icon & Version Resource (Janjanator)
+        shell: pwsh
+        run: |
+          $rcExe = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\rc.exe" | Select-Object -Last 1 -ExpandProperty FullName
+          if ($rcExe) {
+            & $rcExe /nologo /fo "img/janjanator.res" "img/janjanator.rc"
+          }
+
       - name: Build Optimized Single Executable (--release)
-        run: cargo build --release --bin screenshare-win11
+        shell: pwsh
+        run: |
+          if (Test-Path "img/janjanator.res") {
+            cargo rustc --release --bin screenshare-win11 -- -C link-arg=img/janjanator.res
+          } else {
+            cargo build --release --bin screenshare-win11
+          }
 
       - name: Verify Portable Executable Size & Integrity
         shell: pwsh
@@ -42,34 +56,33 @@ jobs:
             throw "Executável não encontrado em $exePath"
           }
           $sizeMb = [math]::Round((Get-Item $exePath).Length / 1MB, 2)
-          Write-Host "Build concluída com sucesso: $exePath ($sizeMb MB)"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item $exePath "dist/screenshare-win11.exe" -Force
-          Get-FileHash "dist/screenshare-win11.exe" -Algorithm SHA256 | Format-List
+          Copy-Item $exePath "dist/Janjanator.exe" -Force
+          Write-Host "Build concluída com sucesso: dist/Janjanator.exe ($sizeMb MB)"
+          Get-FileHash "dist/Janjanator.exe" -Algorithm SHA256 | Format-List
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: screenshare-win11-portable-exe
-          path: dist/screenshare-win11.exe
+          name: Janjanator-portable-exe
+          path: dist/Janjanator.exe
 
       - name: Publish GitHub Release (Private Repo)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.1.0' }}
-          name: "ScreenShare Win11 Native ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.1.0' }}"
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.2.0' }}
+          name: "Janjanator ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.2.0' }}"
           body: |
-            ## ⚡ ScreenShare Win11 Native — Executável Portátil (Windows 11)
+            ## ⭐ Janjanator — Executável Portátil (Windows 11)
             
             ### Como usar (Para os amigos):
-            1. Baixe o arquivo **`screenshare-win11.exe`** anexado abaixo em **Assets**.
-            2. Abra o `screenshare-win11.exe` (não requer instalação).
-            3. Digite o **IP do Host** (Tailscale ou IP Público) + seu **Nickname** e clique em **Conectar à Sala**.
-            4. Para transmitir uma janela com áudio isolado (sem capturar o Discord), clique em **Compartilhar Tela / Janela**, escolha a janela, marque **Compartilhar áudio desta janela (WASAPI PID)** e selecione a qualidade (`720p`, `1080p` ou `Nativo`).
+            1. Baixe apenas o arquivo **`Janjanator.exe`** anexado abaixo em **Assets**.
+            2. Abra o `Janjanator.exe` (não requer instalação).
+            3. Digite o **IP do Host** (ZeroTier, Playit.gg ou IP) + seu **Nickname** e clique em **Conectar à Sala**.
+            4. Para transmitir uma janela com áudio isolado (sem capturar o Discord), clique em **Compartilhar Tela / Janela**, escolha a janela, marque **Compartilhar áudio desta janela (WASAPI PID)** e selecione a qualidade (`720p`, `1080p` ou `Nativo`) a **60 FPS**.
           files: |
-            dist/screenshare-win11.exe
+            dist/Janjanator.exe
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

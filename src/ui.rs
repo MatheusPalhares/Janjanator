@@ -68,6 +68,7 @@ pub struct ScreenShareApp {
     auto_pause_when_minimized: bool,
     was_paused_by_minimize: Option<String>,
     is_fullscreen: bool,
+    app_logo_texture: Option<TextureHandle>,
     video_texture: Option<TextureHandle>,
     last_frame_resolution: (u32, u32),
     last_frame_encoder: String,
@@ -83,6 +84,14 @@ pub struct ScreenShareApp {
 impl ScreenShareApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_dark_theme(&cc.egui_ctx);
+
+        let logo_rgba = include_bytes!("../img/janjanator_icon_64.rgba");
+        let logo_img = ColorImage::from_rgba_unmultiplied([64, 64], logo_rgba);
+        let app_logo_texture = Some(cc.egui_ctx.load_texture(
+            "janjanator-logo",
+            logo_img,
+            TextureOptions::LINEAR,
+        ));
 
         let random_suffix: u16 = rand::random::<u16>() % 9000 + 1000;
         let default_nick =
@@ -140,6 +149,7 @@ impl ScreenShareApp {
             auto_pause_when_minimized: true,
             was_paused_by_minimize: None,
             is_fullscreen: false,
+            app_logo_texture,
             video_texture: None,
             last_frame_resolution: (0, 0),
             last_frame_encoder: String::new(),
@@ -607,11 +617,15 @@ impl ScreenShareApp {
                     .show(ui, |ui| {
                         ui.set_max_width(450.0);
                         ui.vertical_centered(|ui| {
+                            if let Some(ref logo) = self.app_logo_texture {
+                                ui.add(egui::Image::new((logo.id(), Vec2::new(52.0, 52.0))));
+                                ui.add_space(6.0);
+                            }
                             ui.label(
-                                RichText::new("⚡ ScreenShare Win11 Native")
-                                    .font(FontId::proportional(24.0))
+                                RichText::new("Janjanator")
+                                    .font(FontId::proportional(26.0))
                                     .strong()
-                                    .color(Color32::from_rgb(96, 165, 250)),
+                                    .color(Color32::from_rgb(248, 113, 113)),
                             );
                             ui.add_space(4.0);
                             ui.label(
@@ -712,11 +726,15 @@ impl ScreenShareApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if let Some(ref logo) = self.app_logo_texture {
+                        ui.add(egui::Image::new((logo.id(), Vec2::new(22.0, 22.0))));
+                        ui.add_space(4.0);
+                    }
                     ui.label(
-                        RichText::new("⚡ ScreenShare Win11")
-                            .size(16.0)
+                        RichText::new("Janjanator")
+                            .size(16.5)
                             .strong()
-                            .color(Color32::from_rgb(96, 165, 250)),
+                            .color(Color32::from_rgb(248, 113, 113)),
                     );
 
                     ui.separator();

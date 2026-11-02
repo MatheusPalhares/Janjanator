@@ -138,23 +138,24 @@ fn send_ws_gated(
 
 fn main() {
     println!("=============================================================");
-    println!("  ScreenShare Win11 Native - Docker SFU Relay & Hub v2 (60fps)");
+    println!("  Janjanator - Docker SFU Relay & Hub v2 (60fps)             ");
     println!("  - Zero-Copy Binary Relay  : 0.0.0.0:7890 (Max 10 Users)     ");
     println!("  - HTTP Portal & Download  : 0.0.0.0:7888                    ");
     println!("=============================================================");
 
     thread::spawn(|| {
-        if let Ok(bytes) = fs::read("/app/screenshare-win11.exe") {
+        if let Ok(bytes) = fs::read("/app/Janjanator.exe") {
             let _ = fs::create_dir_all("/dist");
+            let _ = fs::remove_file("/dist/screenshare-win11.exe");
             loop {
-                let needs_update = match fs::read("/dist/screenshare-win11.exe") {
+                let needs_update = match fs::read("/dist/Janjanator.exe") {
                     Ok(existing) => existing != bytes,
                     Err(_) => true,
                 };
                 if needs_update {
-                    if fs::write("/dist/screenshare-win11.exe", &bytes).is_ok() {
+                    if fs::write("/dist/Janjanator.exe", &bytes).is_ok() {
                         println!(
-                            "[OK] Executável Windows 11 exportado para ./dist/screenshare-win11.exe ({:.2} MB)",
+                            "[OK] Executável exportado para ./dist/Janjanator.exe ({:.2} MB)",
                             bytes.len() as f64 / (1024.0 * 1024.0)
                         );
                         break;
@@ -453,12 +454,14 @@ fn handle_http_request(
     let req = String::from_utf8_lossy(&buf[..n]);
     let first_line = req.lines().next().unwrap_or("");
 
-    if first_line.starts_with("GET /download/screenshare-win11.exe") {
-        if let Ok(exe_bytes) = fs::read("/app/screenshare-win11.exe")
-            .or_else(|_| fs::read("/dist/screenshare-win11.exe"))
+    if first_line.starts_with("GET /download/Janjanator.exe")
+        || first_line.starts_with("GET /download/screenshare-win11.exe")
+    {
+        if let Ok(exe_bytes) = fs::read("/app/Janjanator.exe")
+            .or_else(|_| fs::read("/dist/Janjanator.exe"))
         {
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"screenshare-win11.exe\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"Janjanator.exe\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 exe_bytes.len()
             );
             let _ = stream.write_all(header.as_bytes());
@@ -473,24 +476,24 @@ fn handle_http_request(
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8"/>
-<title>ScreenShare Win11 Native - Servidor Ativo</title>
+<title>Janjanator - Servidor Ativo</title>
 <style>
 body {{ background:#0d1017; color:#e5e7eb; font-family:system-ui,sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }}
 .card {{ background:#161922; border:1px solid #374151; border-radius:12px; padding:32px; max-width:520px; text-align:center; box-shadow:0 10px 30px rgba(0,0,0,0.5); }}
-h1 {{ color:#60a5fa; margin-top:0; }}
+h1 {{ color:#f87171; margin-top:0; }}
 .badge {{ display:inline-block; background:#065f46; color:#34d399; padding:6px 14px; border-radius:999px; font-weight:600; font-size:14px; margin-bottom:18px; }}
-.btn {{ display:inline-block; background:#2563eb; color:#fff; text-decoration:none; padding:12px 24px; border-radius:8px; font-weight:700; margin-top:16px; }}
-.btn:hover {{ background:#1d4ed8; }}
+.btn {{ display:inline-block; background:#dc2626; color:#fff; text-decoration:none; padding:12px 24px; border-radius:8px; font-weight:700; margin-top:16px; }}
+.btn:hover {{ background:#b91c1c; }}
 code {{ background:#1f2937; padding:3px 6px; border-radius:4px; color:#93c5fd; }}
 </style>
 </head>
 <body>
 <div class="card">
-  <h1>⚡ ScreenShare Win11 Native</h1>
+  <h1>⭐ Janjanator</h1>
   <div class="badge">● Servidor Docker SFU Online ({}/10 usuários na sala)</div>
   <p>Servidor LiveKit SFU (<code>:7880</code>) + Binary Media Relay 60fps (<code>:7890</code>) operacional.</p>
   <p>Baixe o executável portátil para Windows 11 abaixo ou pela aba <b>Releases</b> do GitHub:</p>
-  <a class="btn" href="/download/screenshare-win11.exe">⬇ Baixar screenshare-win11.exe (Portátil)</a>
+  <a class="btn" href="/download/Janjanator.exe">⬇ Baixar Janjanator.exe (Portátil)</a>
 </div>
 </body>
 </html>"#,
