@@ -79,6 +79,11 @@ pub struct ScreenShareApp {
     // Reprodutor de Áudio WASAPI do Viewer
     audio_player: Option<AudioPlaybackEngine>,
     audio_pcm_tx: Option<Sender<Vec<i16>>>,
+
+    // Auto-Updater via GitHub Releases (MatheusPalhares/Janjanator)
+    is_updating_app: Arc<AtomicBool>,
+    update_status_rx: Option<Receiver<String>>,
+    latest_github_tag: Arc<parking_lot::Mutex<String>>,
 }
 
 impl ScreenShareApp {
@@ -104,6 +109,9 @@ impl ScreenShareApp {
             .first()
             .cloned()
             .or_else(|| monitors.first().cloned());
+
+        let latest_github_tag = Arc::new(parking_lot::Mutex::new(String::new()));
+        spawn_github_latest_tag_check(latest_github_tag.clone());
 
         Self {
             server_ip: "127.0.0.1".to_string(),
@@ -159,6 +167,10 @@ impl ScreenShareApp {
 
             audio_player: None,
             audio_pcm_tx: None,
+
+            is_updating_app: Arc::new(AtomicBool::new(false)),
+            update_status_rx: None,
+            latest_github_tag,
         }
     }
 
@@ -478,6 +490,12 @@ impl ScreenShareApp {
             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
         }
 
+        if let Some(ref rx) = self.update_status_rx {
+            while let Ok(msg) = rx.try_recv() {
+                self.status_message = msg;
+            }
+        }
+
         let mut latest_remote_video: Option<DecodedVideoFrame> = None;
         let mut incoming_events = Vec::new();
         if let Some(ref rx) = self.net_event_rx {
@@ -687,7 +705,37 @@ impl ScreenShareApp {
                             self.connect_to_server();
                         }
 
-                        ui.add_space(16.0);
+                        ui.add_space(10.0);
+
+                        let updating = self.is_updating_app.load(Ordering::Relaxed);
+                        let tag_label = self.latest_github_tag.lock().clone();
+                        let btn_text = if updating {
+                            "⏳ Baixando atualização do GitHub...".to_string()
+                        } else if !tag_label.is_empty() {
+                            format!("🔄 Atualizar App (GitHub Release {})", tag_label)
+                        } else {
+                            "🔄 Atualizar App (GitHub Latest Release)".to_string()
+                        };
+
+                        if ui
+                            .add_enabled(
+                                !updating,
+                                egui::Button::new(
+                                    RichText::new(btn_text)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(209, 213, 219)),
+                                )
+                                .fill(Color32::from_rgb(30, 36, 50))
+                                .rounding(Rounding::same(8.0))
+                                .min_size(Vec2::new(410.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            self.trigger_self_update();
+                        }
+
+                        ui.add_space(14.0);
                         ui.separator();
                         ui.add_space(8.0);
 
@@ -782,6 +830,30 @@ impl ScreenShareApp {
                             .clicked()
                         {
                             self.disconnect_from_server();
+                        }
+
+                        ui.add_space(6.0);
+
+                        let updating = self.is_updating_app.load(Ordering::Relaxed);
+                        if ui
+                            .add_enabled(
+                                !updating,
+                                egui::Button::new(
+                                    RichText::new(if updating {
+                                        "⏳ Atualizando..."
+                                    } else {
+                                        "🔄 Atualizar App"
+                                    })
+                                    .color(Color32::from_rgb(209, 213, 219)),
+                                )
+                                .fill(Color32::from_rgb(30, 36, 50)),
+                            )
+                            .on_hover_text(
+                                "Baixa a versão mais recente (Latest Release) do GitHub e reinicia o Janjanator automaticamente",
+                            )
+                            .clicked()
+                        {
+                            self.trigger_self_update();
                         }
 
                         ui.add_space(8.0);
@@ -1568,6 +1640,22 @@ impl ScreenShareApp {
             self.show_share_modal = false;
         }
     }
+
+    fn trigger_self_update(&mut self) {
+        if self.is_updating_app.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded::<String>(16);
+        self.update_status_rx = Some(rx);
+        let updating_flag = self.is_updating_app.clone();
+
+        thread::Builder::new()
+            .name("github-self-updater".to_string())
+            .spawn(move || {
+                run_github_self_update(tx, updating_flag);
+            })
+            .ok();
+    }
 }
 
 fn configure_dark_theme(ctx: &Context) {
@@ -1575,4 +1663,160 @@ fn configure_dark_theme(ctx: &Context) {
     visuals.window_fill = Color32::from_rgb(18, 21, 29);
     visuals.panel_fill = Color32::from_rgb(13, 16, 23);
     ctx.set_visuals(visuals);
+}
+
+/// Consulta silenciosamente em segundo plano a tag da última Release no GitHub.
+fn spawn_github_latest_tag_check(tag_out: Arc<parking_lot::Mutex<String>>) {
+    thread::Builder::new()
+        .name("github-version-checker".to_string())
+        .spawn(move || {
+            let mut cmd = std::process::Command::new("curl.exe");
+            cmd.args([
+                "-sL",
+                "-m",
+                "6",
+                "-H",
+                "User-Agent: Janjanator-AutoUpdater",
+                "https://api.github.com/repos/MatheusPalhares/Janjanator/releases/latest",
+            ]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+            if let Ok(output) = cmd.output() {
+                if output.status.success() {
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                        if let Some(tag) = json.get("tag_name").and_then(|v| v.as_str()) {
+                            *tag_out.lock() = tag.to_string();
+                        }
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
+/// Baixa o `.exe` mais recente da aba Releases (`MatheusPalhares/Janjanator`), substitui o executável atual em execução e reinicia.
+fn run_github_self_update(status_tx: Sender<String>, updating_flag: Arc<AtomicBool>) {
+    let _ = status_tx.send("🔍 Verificando última versão no GitHub Releases...".to_string());
+
+    let Ok(current_exe) = std::env::current_exe() else {
+        let _ = status_tx.send("❌ Não foi possível localizar o caminho do executável atual.".to_string());
+        updating_flag.store(false, Ordering::SeqCst);
+        return;
+    };
+
+    // 1. Descobrir a URL do asset .exe na última release via API do GitHub
+    let mut download_url =
+        "https://github.com/MatheusPalhares/Janjanator/releases/latest/download/Janjanator.exe"
+            .to_string();
+    let mut release_tag = "latest".to_string();
+
+    let mut api_cmd = std::process::Command::new("curl.exe");
+    api_cmd.args([
+        "-sL",
+        "-m",
+        "10",
+        "-H",
+        "User-Agent: Janjanator-AutoUpdater",
+        "https://api.github.com/repos/MatheusPalhares/Janjanator/releases/latest",
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        api_cmd.creation_flags(0x08000000);
+    }
+
+    if let Ok(output) = api_cmd.output() {
+        if output.status.success() {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if let Some(tag) = json.get("tag_name").and_then(|v| v.as_str()) {
+                    release_tag = tag.to_string();
+                }
+                if let Some(assets) = json.get("assets").and_then(|v| v.as_array()) {
+                    for asset in assets {
+                        if let Some(url) = asset
+                            .get("browser_download_url")
+                            .and_then(|v| v.as_str())
+                        {
+                            if url.ends_with(".exe") {
+                                download_url = url.to_string();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = status_tx.send(format!(
+        "⬇ Baixando Janjanator ({}) direto do GitHub...",
+        release_tag
+    ));
+
+    let new_exe_path = current_exe.with_extension("exe.new");
+    let old_exe_path = current_exe.with_extension("exe.old");
+    let _ = std::fs::remove_file(&new_exe_path);
+
+    let mut dl_cmd = std::process::Command::new("curl.exe");
+    dl_cmd.args([
+        "-fL",
+        "-m",
+        "120",
+        "-H",
+        "User-Agent: Janjanator-AutoUpdater",
+        &download_url,
+        "-o",
+        &new_exe_path.to_string_lossy(),
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        dl_cmd.creation_flags(0x08000000);
+    }
+
+    let dl_ok = dl_cmd
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let valid_pe = match std::fs::read(&new_exe_path) {
+        Ok(bytes) => bytes.len() > 1_000_000 && bytes.starts_with(b"MZ"),
+        Err(_) => false,
+    };
+
+    if !dl_ok || !valid_pe {
+        let _ = std::fs::remove_file(&new_exe_path);
+        let _ = status_tx.send(
+            "❌ Falha ao baixar atualização. Verifique se há uma Release publicada no GitHub."
+                .to_string(),
+        );
+        updating_flag.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    // 2. No Windows, um .exe em execução pode ser renomeado para .old e substituído pelo novo!
+    let _ = std::fs::remove_file(&old_exe_path);
+    if std::fs::rename(&current_exe, &old_exe_path).is_err() {
+        let _ = std::fs::remove_file(&new_exe_path);
+        let _ = status_tx.send("❌ Não foi possível substituir o executável atual.".to_string());
+        updating_flag.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    if std::fs::rename(&new_exe_path, &current_exe).is_err() {
+        // Reverter caso falhe
+        let _ = std::fs::rename(&old_exe_path, &current_exe);
+        let _ = status_tx.send("❌ Erro ao mover novo executável.".to_string());
+        updating_flag.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    let _ = status_tx.send("✅ Atualizado com sucesso! Reiniciando Janjanator...".to_string());
+    thread::sleep(Duration::from_millis(400));
+
+    let _ = std::process::Command::new(&current_exe).spawn();
+    std::process::exit(0);
 }

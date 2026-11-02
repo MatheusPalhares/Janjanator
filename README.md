@@ -39,6 +39,7 @@ Você **não** precisa instalar Rust, Docker nem baixar o código-fonte.
 4. Digite seu **Nickname** e clique em **🚀 Conectar à Sala**.
 5. **Para assistir:** Clique em **▶ Assistir Stream** ao lado do nome do seu amigo (duplo clique no vídeo abre em **Tela Cheia**).
 6. **Para transmitir sua tela/jogo:** Clique em **🖥 Compartilhar Tela / Janela**, selecione a janela do jogo ou monitor, marque **Compartilhar áudio isolado desta janela**, escolha `1080p` / `60 FPS` / `Auto` e inicie.
+7. **Para atualizar quando sair versão nova:** Basta clicar no botão **🔄 Atualizar App (GitHub Release)** na tela inicial ou no topo do aplicativo — ele baixa a versão `latest` do GitHub, substitui o `.exe` e reinicia sozinho.
 
 ---
 

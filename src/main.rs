@@ -16,6 +16,12 @@ const JANJANATOR_ICON_RGBA: &[u8] = include_bytes!("../img/janjanator_icon_64.rg
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // Limpar binário antigo (.old) caso o app tenha acabado de se auto-atualizar
+    if let Ok(exe_path) = std::env::current_exe() {
+        let old_path = exe_path.with_extension("exe.old");
+        let _ = std::fs::remove_file(old_path);
+    }
+
     // Configurar Per-Monitor DPI Awareness no Windows 11 para captura em resolução real (Nativo/1080p)
     #[cfg(windows)]
     unsafe {
