@@ -241,8 +241,8 @@ impl RoomNetworkClient {
     ) -> Self {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<OutgoingCommand>(32);
         let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
-        // Fila de saída de vídeo com 1 slot para pipeline paralelo CPU (encode N+1) + Rede (envio N)
-        let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
+        // Fila de saída de vídeo com 3 slots (~50ms) para que o encoder 60 FPS nunca perca o frame par enquanto a thread de rede consome o ímpar!
+        let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(3);
         let socket_busy = Arc::new(AtomicBool::new(false));
         let socket_busy_clone = socket_busy.clone();
 
@@ -388,8 +388,12 @@ fn run_network_worker(
                     let Ok(mut pkt) = vdec_rx.recv_timeout(Duration::from_millis(50)) else {
                         continue;
                     };
-                    // Processar todos os deltas acumulados em ordem no canvas e emitir o frame final atualizado
-                    while let Ok(next_pkt) = vdec_rx.try_recv() {
+                    // Só fundir frames intermediários se houver atraso real acumulado (>3 frames na fila);
+                    // em rajadas normais de 2 pacotes do TCP/ZeroTier, emite cada frame individualmente para manter 60 FPS!
+                    while vdec_rx.len() > 3 {
+                        let Ok(next_pkt) = vdec_rx.try_recv() else {
+                            break;
+                        };
                         if next_pkt.is_keyframe {
                             pkt = next_pkt;
                         } else {
@@ -577,14 +581,15 @@ fn run_network_worker(
                 break;
             }
 
-            // 4. Vídeo de Saída (apenas 1 frame por vez quando o socket está 100% livre)
-            if !pending_flush {
-                if let Ok(video_bin) = video_rx.try_recv() {
-                    did_work = true;
-                    if !send_ws_gated(&mut socket, video_bin, &mut pending_flush) {
-                        connection_alive = false;
-                        break;
-                    }
+            // 4. Vídeo de Saída (descarrega todos os frames prontos enquanto o socket TCP aceitar sem bloquear)
+            while !pending_flush {
+                let Ok(video_bin) = video_rx.try_recv() else {
+                    break;
+                };
+                did_work = true;
+                if !send_ws_gated(&mut socket, video_bin, &mut pending_flush) {
+                    connection_alive = false;
+                    break;
                 }
             }
 
@@ -838,12 +843,13 @@ fn handle_embedded_peer(
                 }
             }
 
-            if !pending_flush {
-                if let Ok(bin) = video_rx.try_recv() {
-                    active = true;
-                    if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
-                        return;
-                    }
+            while !pending_flush {
+                let Ok(bin) = video_rx.try_recv() else {
+                    break;
+                };
+                active = true;
+                if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
+                    return;
                 }
             }
         }

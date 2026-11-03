@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const APP_VERSION: &str = match option_env!("JANJANATOR_BUILD_VERSION") {
     Some(v) => v,
-    None => "v0.3.0",
+    None => "v0.6.6",
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,19 +79,11 @@ impl FpsPreset {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BitratePreset {
     AutoAdaptive,
-    Medium6Mbps,
-    High12Mbps,
-    Ultra25Mbps,
 }
 
 impl BitratePreset {
     pub fn bps(&self) -> u32 {
-        match self {
-            BitratePreset::AutoAdaptive => 20_000_000,
-            BitratePreset::Medium6Mbps => 6_000_000,
-            BitratePreset::High12Mbps => 12_000_000,
-            BitratePreset::Ultra25Mbps => 25_000_000,
-        }
+        25_000_000
     }
 
     pub fn kbps(&self) -> u32 {
@@ -99,30 +91,15 @@ impl BitratePreset {
     }
 
     pub fn initial_quality(&self) -> u8 {
-        match self {
-            BitratePreset::AutoAdaptive => 82,
-            BitratePreset::Medium6Mbps => 72,
-            BitratePreset::High12Mbps => 84,
-            BitratePreset::Ultra25Mbps => 92,
-        }
+        84
     }
 
     pub fn label(&self) -> &'static str {
-        match self {
-            BitratePreset::AutoAdaptive => "⚡ Auto (Máximo Estável)",
-            BitratePreset::Medium6Mbps => "Médio (6 Mbps)",
-            BitratePreset::High12Mbps => "Alto (12 Mbps)",
-            BitratePreset::Ultra25Mbps => "Ultra (25 Mbps)",
-        }
+        "⚡ Automático (Máximo Estável)"
     }
 
     pub fn short_label(&self) -> &'static str {
-        match self {
-            BitratePreset::AutoAdaptive => "Auto",
-            BitratePreset::Medium6Mbps => "6 Mbps",
-            BitratePreset::High12Mbps => "12 Mbps",
-            BitratePreset::Ultra25Mbps => "25 Mbps",
-        }
+        "Auto Máx"
     }
 }
 

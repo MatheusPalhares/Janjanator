@@ -536,8 +536,8 @@ fn run_capture_loop(
             let mut raw_dims = (0u32, 0u32);
 
             if let Some(ref mut engine) = wgc_engine {
-                // Tentar pegar o frame imediatamente; se o VSync do DWM estiver a ~1ms de distância, aguardar brevemente
-                let poll_deadline = Instant::now() + Duration::from_micros(2200);
+                // Tentar pegar o frame imediatamente; poll curto de 450us para não roubar CPU do encoder
+                let poll_deadline = Instant::now() + Duration::from_micros(450);
                 loop {
                     if let Some((w, h)) = engine.try_grab_latest_frame(&mut raw_bgra_buf) {
                         got_new_gpu_frame = true;
@@ -572,7 +572,7 @@ fn run_capture_loop(
                     bgra: final_bgra,
                 });
             } else if let Some((dst_w, dst_h, ref cached)) = last_scaled_cache {
-                // Mantém cadência constante de 30/60 FPS mesmo quando o DWM não redesenhou a janela no tick
+                // Mantém cadência exata de 30/60 FPS mesmo quando o DWM não redesenhou a janela no tick
                 let _ = event_tx.try_send(CaptureEvent::FrameCaptured {
                     width: dst_w,
                     height: dst_h,
@@ -584,12 +584,12 @@ fn run_capture_loop(
             let now = Instant::now();
             if next_tick > now {
                 let wait = next_tick - now;
-                // No Windows o timer padrão do kernel tem granularidade de 15.6ms;
-                // só usar thread::sleep se sobrar mais de 16ms (ex.: 30 FPS), e usar yield_now para precisão de 60 FPS
-                if wait > Duration::from_millis(16) {
-                    thread::sleep(wait - Duration::from_millis(15));
+                // Com timeBeginPeriod(1) ativo em main.rs, o sleep do Windows tem precisão de ~1ms.
+                // Dormir até faltar 2ms libera 100% dos núcleos para o codificador Rayon manter 60 FPS cravados!
+                if wait > Duration::from_millis(3) {
+                    thread::sleep(wait - Duration::from_millis(2));
                 }
-                while Instant::now() + Duration::from_micros(800) < next_tick {
+                while Instant::now() + Duration::from_micros(250) < next_tick {
                     thread::yield_now();
                 }
                 while Instant::now() < next_tick {

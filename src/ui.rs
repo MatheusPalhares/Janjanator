@@ -340,7 +340,6 @@ impl ScreenShareApp {
                         viewer_congested,
                         kbps_atomic,
                     );
-                    let mut preview_div: u32 = 0;
 
                     while !stop_clone.load(Ordering::Relaxed) {
                         // Aguardar evento de vídeo com wakeup instantâneo (< 0.01ms)
@@ -387,7 +386,7 @@ impl ScreenShareApp {
                                     rtt_atomic.load(Ordering::Relaxed) as u64,
                                 );
 
-                                // Pipeline paralelo: enquanto o socket TCP descarrega o frame N, a CPU já codifica o frame N+1!
+                                // Pipeline paralelo 60 FPS: fila de 3 slots garante que nenhum frame par seja descartado
                                 if !tx.is_video_busy() {
                                     if let Some(pkt) =
                                         v_encoder.encode_bgra_frame(width, height, &bgra)
@@ -397,9 +396,8 @@ impl ScreenShareApp {
                                 }
                             }
 
-                            // Prévia local a 30 FPS (1 a cada 2 frames) para não roubar largura de banda de memória do encoder 60 FPS
-                            preview_div = preview_div.wrapping_add(1);
-                            if want_preview.load(Ordering::Relaxed) && (preview_div & 1 == 0) {
+                            // Prévia local na taxa exata selecionada (30 ou 60 FPS), sem divisor de frames!
+                            if want_preview.load(Ordering::Relaxed) && !preview_tx.is_full() {
                                 let mut rgba = vec![255u8; bgra.len()];
                                 rgba.par_chunks_exact_mut(4)
                                     .zip(bgra.par_chunks_exact(4))
@@ -519,11 +517,13 @@ impl ScreenShareApp {
         }
 
         let mut latest_remote_video: Option<DecodedVideoFrame> = None;
+        let mut remote_frames_in_tick: u32 = 0;
         let mut incoming_events = Vec::new();
         if let Some(ref rx) = self.net_event_rx {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     NetworkEvent::RemoteVideoFrame(frame) => {
+                        remote_frames_in_tick += 1;
                         latest_remote_video = Some(frame);
                     }
                     other => incoming_events.push(other),
@@ -572,21 +572,23 @@ impl ScreenShareApp {
         }
 
         if let Some(frame) = latest_remote_video {
-            self.upload_video_frame(ctx, frame);
+            self.upload_video_frame(ctx, frame, remote_frames_in_tick.max(1));
         } else if self.watching_identity.is_none() && self.is_publishing && self.show_self_preview {
             let mut latest_preview = None;
+            let mut preview_frames_in_tick: u32 = 0;
             if let Some(ref rx) = self.local_preview_rx {
                 while let Ok(frame) = rx.try_recv() {
+                    preview_frames_in_tick += 1;
                     latest_preview = Some(frame);
                 }
             }
             if let Some(frame) = latest_preview {
-                self.upload_video_frame(ctx, frame);
+                self.upload_video_frame(ctx, frame, preview_frames_in_tick.max(1));
             }
         }
     }
 
-    fn upload_video_frame(&mut self, ctx: &Context, frame: DecodedVideoFrame) {
+    fn upload_video_frame(&mut self, ctx: &Context, frame: DecodedVideoFrame, count: u32) {
         let size = [frame.width as usize, frame.height as usize];
         if frame.rgba.len() < size[0] * size[1] * 4 {
             return;
@@ -602,7 +604,7 @@ impl ScreenShareApp {
 
         self.last_frame_resolution = (frame.width, frame.height);
         self.last_frame_encoder = frame.hw_encoder_name;
-        self.fps_counter_frames += 1;
+        self.fps_counter_frames += count;
         let elapsed = self.fps_counter_instant.elapsed();
         if elapsed >= Duration::from_millis(500) {
             let fps = (self.fps_counter_frames as f64 / elapsed.as_secs_f64()).round() as u32;
@@ -1596,49 +1598,6 @@ impl ScreenShareApp {
                                     .clicked()
                                 {
                                     self.selected_fps = preset;
-                                }
-                            }
-                        });
-
-                        ui.add_space(8.0);
-
-                        // Linha 3: Bitrate (com Auto Adaptativo!)
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("⚡ Bitrate:")
-                                    .size(13.0)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            );
-                            ui.add_space(24.0);
-                            for preset in [
-                                BitratePreset::AutoAdaptive,
-                                BitratePreset::Medium6Mbps,
-                                BitratePreset::High12Mbps,
-                                BitratePreset::Ultra25Mbps,
-                            ] {
-                                let active = self.selected_bitrate == preset;
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(preset.label()).size(12.0).strong().color(
-                                                if active {
-                                                    Color32::WHITE
-                                                } else {
-                                                    Color32::LIGHT_GRAY
-                                                },
-                                            ),
-                                        )
-                                        .fill(if active {
-                                            Color32::from_rgb(37, 99, 235)
-                                        } else {
-                                            Color32::from_rgb(28, 34, 48)
-                                        })
-                                        .rounding(Rounding::same(6.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.selected_bitrate = preset;
                                 }
                             }
                         });

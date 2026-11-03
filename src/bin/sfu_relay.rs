@@ -256,12 +256,13 @@ fn handle_peer_connection(
                 }
             }
 
-            if !pending_flush {
-                if let Ok(bin) = video_rx.try_recv() {
-                    active = true;
-                    if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
-                        return;
-                    }
+            while !pending_flush {
+                let Ok(bin) = video_rx.try_recv() else {
+                    break;
+                };
+                active = true;
+                if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
+                    return;
                 }
             }
         }

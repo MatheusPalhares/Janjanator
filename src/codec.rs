@@ -23,7 +23,7 @@ use windows::Win32::{
     System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED},
 };
 
-const NUM_PARALLEL_BANDS: usize = 16;
+const NUM_PARALLEL_BANDS: usize = 15;
 
 /// 2.2. Detecta o codificador de hardware H.264/AV1 disponível na GPU do Windows 11 via Media Foundation (`MFTEnumEx`).
 pub fn detect_hardware_video_encoder() -> String {
@@ -83,26 +83,25 @@ pub fn detect_hardware_video_encoder() -> String {
     }
 }
 
-/// Verifica rapidamente se uma faixa horizontal teve mudança visual real (ignorando ruído de 1 bit do DWM).
+/// Verifica rapidamente se uma faixa horizontal teve mudança visual real (ignorando ruído de dithering do DWM).
 #[inline]
 fn band_has_visual_change(cur: &[u8], prev: &[u8]) -> bool {
     if cur.len() != prev.len() {
         return true;
     }
-    // Comparação rápida em blocos de 64 bytes; se idêntico em memória, retorna false em < 0.02ms
-    if cur == prev {
-        return false;
-    }
-    // Se diferir, verificar se a diferença supera limiar de ruído (2 níveis de cor)
     let len = cur.len();
-    let step = 16; // amostra a cada 4 pixels
+    let step = 32; // amostra a cada 8 pixels em paralelo nos núcleos da CPU
+    let mut changed_samples = 0u32;
     let mut i = 0;
     while i + 2 < len {
         let db = (cur[i] as i16 - prev[i] as i16).abs();
         let dg = (cur[i + 1] as i16 - prev[i + 1] as i16).abs();
         let dr = (cur[i + 2] as i16 - prev[i + 2] as i16).abs();
-        if db > 2 || dg > 2 || dr > 2 {
-            return true;
+        if db > 3 || dg > 3 || dr > 3 {
+            changed_samples += 1;
+            if changed_samples >= 2 {
+                return true;
+            }
         }
         i += step;
     }
@@ -158,26 +157,20 @@ impl LowLatencyVideoEncoder {
         &self.hw_encoder_name
     }
 
-    /// Ajusta dinamicamente a qualidade conforme folga de rede, RTT e feedback de congestionamento do espectador (ZeroTier).
+    /// Ajusta dinamicamente a qualidade no máximo possível estável conforme folga de rede, RTT e feedback do espectador.
     pub fn notify_network_pressure(&mut self, queue_len: usize, rtt_ms: u64) {
-        let (min_q, max_q) = match self.bitrate_preset {
-            BitratePreset::AutoAdaptive => (64, 86),
-            BitratePreset::Medium6Mbps => (64, 75),
-            BitratePreset::High12Mbps => (74, 88),
-            BitratePreset::Ultra25Mbps => (84, 94),
-        };
+        let _ = self.bitrate_preset;
+        let min_q: u8 = 68;
+        let max_q: u8 = 88;
 
         let congested_remote = self.viewer_congested.swap(false, Ordering::Relaxed);
         if congested_remote {
-            // O SFU avisou que o socket do espectador descartou um pacote antigo:
-            // reduz suavemente a qualidade mantendo nitidez alta (nunca cai para 38/40)
-            // e deixa o Rolling Band Refresh (16 faixas) recompor sem explodir o link com Keyframe gigante.
             self.adaptive_quality = self.adaptive_quality.saturating_sub(3).max(min_q);
             self.stable_frames_count = 0;
             return;
         }
 
-        if queue_len > 1 || rtt_ms > 180 {
+        if queue_len > 2 || rtt_ms > 180 {
             self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(min_q);
             self.stable_frames_count = 0;
         } else if rtt_ms > 120 {
@@ -185,7 +178,7 @@ impl LowLatencyVideoEncoder {
             self.stable_frames_count = 0;
         } else {
             self.stable_frames_count += 1;
-            if self.stable_frames_count >= 20 {
+            if self.stable_frames_count >= 18 {
                 self.stable_frames_count = 0;
                 if self.adaptive_quality < max_q {
                     self.adaptive_quality += 1;
@@ -194,7 +187,7 @@ impl LowLatencyVideoEncoder {
         }
     }
 
-    /// Codifica um frame BGRA em paralelo nos múltiplos núcleos da CPU (< 2ms para 1080p).
+    /// Codifica um frame BGRA 100% em paralelo nos múltiplos núcleos da CPU (detecção delta + cópia + JPEG fundidos).
     pub fn encode_bgra_frame(
         &mut self,
         width: u32,
@@ -206,11 +199,15 @@ impl LowLatencyVideoEncoder {
             return None;
         }
 
-        let encode_start = Instant::now();
         self.sequence += 1;
 
         let dims_changed =
             self.prev_dims != (width, height) || self.prev_bgra.len() != expected_len;
+        if dims_changed {
+            self.prev_bgra.resize(expected_len, 0);
+            self.prev_dims = (width, height);
+        }
+
         let is_keyframe = self.sequence == 1
             || dims_changed
             || self.force_keyframe.swap(false, Ordering::SeqCst);
@@ -220,18 +217,20 @@ impl LowLatencyVideoEncoder {
         let num_bands = NUM_PARALLEL_BANDS.min(height as usize).max(1);
         let base_band_h = (height as usize) / num_bands;
         let stride = (width as usize) * 4;
-        // Rolling refresh: atualiza ciclicamente 1 faixa a cada frame para auto-curar a imagem em 133ms sem picos de rede
+        // Rolling refresh: atualiza ciclicamente 1 faixa a cada frame para manter nitidez máxima contínua
         let rolling_band = (self.sequence as usize) % num_bands;
 
-        struct BandJob<'a> {
+        struct BandTask<'a> {
             band_idx: u8,
             y_start: u32,
             band_h: u32,
+            force_encode: bool,
             src_slice: &'a [u8],
-            changed: bool,
+            prev_slice: &'a mut [u8],
         }
 
-        let mut jobs = Vec::with_capacity(num_bands);
+        let mut tasks = Vec::with_capacity(num_bands);
+        let mut prev_rem: &mut [u8] = &mut self.prev_bgra[..expected_len];
         for b in 0..num_bands {
             let y_start = b * base_band_h;
             let y_end = if b + 1 == num_bands {
@@ -240,42 +239,43 @@ impl LowLatencyVideoEncoder {
                 (b + 1) * base_band_h
             };
             let band_h = y_end - y_start;
-            let byte_range = (y_start * stride)..(y_end * stride);
-            let src_slice = &bgra[byte_range.clone()];
+            let band_bytes = band_h * stride;
+            let (prev_band, rest) = prev_rem.split_at_mut(band_bytes);
+            prev_rem = rest;
 
-            let changed = if is_keyframe || b == rolling_band {
-                true
-            } else {
-                band_has_visual_change(src_slice, &self.prev_bgra[byte_range])
-            };
+            let src_slice = &bgra[(y_start * stride)..(y_end * stride)];
+            let force_encode = is_keyframe || b == rolling_band;
 
-            jobs.push(BandJob {
+            tasks.push(BandTask {
                 band_idx: b as u8,
                 y_start: y_start as u32,
                 band_h: band_h as u32,
+                force_encode,
                 src_slice,
-                changed,
+                prev_slice: prev_band,
             });
         }
 
-        // Atualizar cache de referência para delta-frames futuros
-        if dims_changed {
-            self.prev_bgra = bgra[..expected_len].to_vec();
-            self.prev_dims = (width, height);
-        } else {
-            self.prev_bgra.copy_from_slice(&bgra[..expected_len]);
-        }
-
-        // Codificar todas as faixas modificadas em paralelo via Rayon
-        let encoded_bands: Vec<(u8, u32, u32, Vec<u8>)> = jobs
+        // Detectar mudança visual, atualizar cache prev_bgra e codificar JPEG simultaneamente em todos os núcleos via Rayon!
+        let encoded_bands: Vec<(u8, u32, u32, Vec<u8>)> = tasks
             .into_par_iter()
-            .filter(|job| job.changed)
-            .filter_map(|job| {
-                let pixel_count = (width as usize) * (job.band_h as usize);
+            .filter_map(|task| {
+                let changed = if task.force_encode {
+                    true
+                } else {
+                    band_has_visual_change(task.src_slice, task.prev_slice)
+                };
+                if !changed {
+                    return None;
+                }
+
+                task.prev_slice.copy_from_slice(task.src_slice);
+
+                let pixel_count = (width as usize) * (task.band_h as usize);
                 let mut rgb = vec![0u8; pixel_count * 3];
                 for (dst, src) in rgb
                     .chunks_exact_mut(3)
-                    .zip(job.src_slice.chunks_exact(4))
+                    .zip(task.src_slice.chunks_exact(4))
                 {
                     dst[0] = src[2];
                     dst[1] = src[1];
@@ -287,15 +287,15 @@ impl LowLatencyVideoEncoder {
                     let mut cursor = Cursor::new(&mut jpeg_buf);
                     let mut encoder = JpegEncoder::new_with_quality(&mut cursor, quality);
                     encoder
-                        .encode(&rgb, width, job.band_h, ColorType::Rgb8.into())
+                        .encode(&rgb, width, task.band_h, ColorType::Rgb8.into())
                         .ok()?;
                 }
 
-                Some((job.band_idx, job.y_start, job.band_h, jpeg_buf))
+                Some((task.band_idx, task.y_start, task.band_h, jpeg_buf))
             })
             .collect();
 
-        // Empacotamento binário direto das faixas JPEG (sem overhead de LZ4 sobre JPEG já comprimido)
+        // Empacotamento binário direto das faixas JPEG
         let total_jpeg_bytes: usize = encoded_bands.iter().map(|(_, _, _, b)| b.len() + 13).sum();
         let mut raw_payload = Vec::with_capacity(1 + total_jpeg_bytes);
         let _ = raw_payload.write_u8(encoded_bands.len() as u8);
@@ -307,8 +307,7 @@ impl LowLatencyVideoEncoder {
             let _ = raw_payload.write_all(&jpeg_bytes);
         }
 
-        // Medir bitrate real enviado na janela de 0.5s e manter dentro do orçamento sem esmagar a nitidez
-        let _ = encode_start;
+        // Medir bitrate real enviado na janela de 0.5s e manter no máximo estável
         self.bytes_in_window += raw_payload.len() as u64;
         let elapsed_sec = self.window_start.elapsed().as_secs_f64();
         if elapsed_sec >= 0.5 {
@@ -317,14 +316,8 @@ impl LowLatencyVideoEncoder {
             self.bytes_in_window = 0;
             self.window_start = Instant::now();
 
-            let (target_max_kbps, min_q) = match self.bitrate_preset {
-                BitratePreset::AutoAdaptive => (15_000, 64),
-                BitratePreset::Medium6Mbps => (7_000, 64),
-                BitratePreset::High12Mbps => (14_000, 74),
-                BitratePreset::Ultra25Mbps => (28_000, 84),
-            };
-            if kbps > target_max_kbps {
-                self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(min_q);
+            if kbps > 18_000 {
+                self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(68);
             }
         }
 
