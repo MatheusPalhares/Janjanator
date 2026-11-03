@@ -2,7 +2,7 @@ use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -18,11 +18,15 @@ use windows::{
         AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
         AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIOCLIENT_ACTIVATION_PARAMS,
         AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-        PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+        PROCESS_LOOPBACK_MODE, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
         PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, WAVEFORMATEX,
     },
     Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+    },
+    Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
     },
     Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject},
 };
@@ -32,6 +36,37 @@ pub const AUDIO_CHANNELS: u16 = 2;
 /// 20ms frame at 48kHz stereo = 960 samples per channel = 1920 i16 samples
 pub const AUDIO_FRAME_SAMPLES: usize = 960 * 2;
 
+/// Executáveis do Discord (Stable, PTB, Canary e Development) excluídos da captura de tela inteira.
+const DISCORD_PROCESS_NAMES: &[&str] = &[
+    "discord.exe",
+    "discordptb.exe",
+    "discordcanary.exe",
+    "discorddevelopment.exe",
+];
+
+/// Intervalo para verificar se o Discord foi aberto, fechado ou reiniciado durante a transmissão.
+const DISCORD_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// O que deve ser capturado pelo WASAPI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioCaptureTarget {
+    /// Somente o áudio da árvore de processos do PID (compartilhamento de janela).
+    ProcessTree(u32),
+    /// Todo o áudio do Windows (compartilhamento de tela inteira).
+    /// Com `exclude_discord`, a árvore de processos do Discord fica de fora (sem eco da call).
+    Desktop { exclude_discord: bool },
+}
+
+impl AudioCaptureTarget {
+    /// PID anunciado junto com os frames de áudio (0 = áudio do sistema).
+    fn source_pid(&self) -> u32 {
+        match self {
+            AudioCaptureTarget::ProcessTree(pid) => *pid,
+            AudioCaptureTarget::Desktop { .. } => 0,
+        }
+    }
+}
+
 /// Estrutura que gerencia a captura de áudio isolada por PID (Windows 11 WASAPI Process Loopback).
 pub struct ProcessAudioCaptureSession {
     stop_flag: Arc<AtomicBool>,
@@ -39,17 +74,17 @@ pub struct ProcessAudioCaptureSession {
 }
 
 impl ProcessAudioCaptureSession {
-    pub fn start(target_pid: u32, pcm_tx: Sender<(u32, Vec<i16>)>) -> Self {
+    pub fn start(target: AudioCaptureTarget, pcm_tx: Sender<(u32, Vec<i16>)>) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
 
         let worker = thread::Builder::new()
-            .name(format!("wasapi-pid-{}-loopback", target_pid))
+            .name(format!("wasapi-pid-{}-loopback", target.source_pid()))
             .spawn(move || {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     #[cfg(windows)]
                     unsafe {
-                        run_process_loopback_capture(target_pid, stop_clone, pcm_tx);
+                        run_process_loopback_capture(target, stop_clone, pcm_tx);
                     }
                 }));
             })
@@ -152,11 +187,51 @@ unsafe extern "system" fn completion_activate_completed(
     S_OK
 }
 
-/// 1.4. Ativa `IAudioClient` isolado para a árvore de processos do `target_pid` no Windows 11.
+/// Procura o processo raiz do Discord (o `Discord.exe` cujo pai não é outro processo do Discord).
+/// Excluir a árvore desse PID remove a voz da call e os sons de notificação, que tocam nos processos filhos.
+#[cfg(windows)]
+pub fn find_discord_root_pid() -> Option<u32> {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        // (pid, pid do pai) de cada processo do Discord
+        let mut discord: Vec<(u32, u32)> = Vec::new();
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..len]).to_ascii_lowercase();
+                if DISCORD_PROCESS_NAMES.contains(&name.as_str()) {
+                    discord.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+
+        discord
+            .iter()
+            .find(|(_, parent)| !discord.iter().any(|(pid, _)| pid == parent))
+            .map(|(pid, _)| *pid)
+    }
+}
+
+/// 1.4. Ativa `IAudioClient` de Process Loopback para a árvore de processos do `target_pid` no Windows 11.
+/// `mode` define se a árvore é a única capturada (INCLUDE) ou se tudo é capturado menos ela (EXCLUDE).
 /// Usa `ManuallyDrop<PROPVARIANT>` para evitar que `PropVariantClear` tente dar `CoTaskMemFree`
 /// no ponteiro da stack `&mut activation_params` (o que causava `STATUS_HEAP_CORRUPTION 0xC0000374`).
 #[cfg(windows)]
-unsafe fn activate_process_loopback_client(target_pid: u32) -> Option<IAudioClient> {
+unsafe fn activate_process_loopback_client(
+    target_pid: u32,
+    mode: PROCESS_LOOPBACK_MODE,
+) -> Option<IAudioClient> {
     if target_pid == 0 {
         return activate_desktop_loopback_client();
     }
@@ -168,11 +243,7 @@ unsafe fn activate_process_loopback_client(target_pid: u32) -> Option<IAudioClie
         Anonymous: windows::Win32::Media::Audio::AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
                 TargetProcessId: target_pid,
-                ProcessLoopbackMode: if target_pid > 0 {
-                    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
-                } else {
-                    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
-                },
+                ProcessLoopbackMode: mode,
             },
         },
     };
@@ -258,17 +329,72 @@ unsafe fn activate_desktop_loopback_client() -> Option<IAudioClient> {
 
 #[cfg(windows)]
 unsafe fn run_process_loopback_capture(
-    target_pid: u32,
+    target: AudioCaptureTarget,
     stop_flag: Arc<AtomicBool>,
     pcm_tx: Sender<(u32, Vec<i16>)>,
 ) {
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
-    let Some(audio_client) = activate_process_loopback_client(target_pid) else {
-        CoUninitialize();
-        return;
-    };
+    let source_pid = target.source_pid();
+    let watch_discord = matches!(
+        target,
+        AudioCaptureTarget::Desktop {
+            exclude_discord: true
+        }
+    );
 
+    // Recria o cliente de áudio sempre que o Discord abre, fecha ou reinicia (PID raiz muda).
+    while !stop_flag.load(Ordering::Relaxed) {
+        let excluded_pid = if watch_discord {
+            find_discord_root_pid()
+        } else {
+            None
+        };
+
+        let audio_client = match (target, excluded_pid) {
+            (AudioCaptureTarget::ProcessTree(pid), _) => activate_process_loopback_client(
+                pid,
+                PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+            ),
+            (AudioCaptureTarget::Desktop { .. }, Some(discord_pid)) => {
+                activate_process_loopback_client(
+                    discord_pid,
+                    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+                )
+            }
+            (AudioCaptureTarget::Desktop { .. }, None) => activate_desktop_loopback_client(),
+        };
+        let Some(audio_client) = audio_client else {
+            break;
+        };
+
+        let discord_changed = || watch_discord && find_discord_root_pid() != excluded_pid;
+        let restart = capture_until_stopped(
+            &audio_client,
+            &stop_flag,
+            &pcm_tx,
+            source_pid,
+            discord_changed,
+        );
+        let _ = audio_client.Stop();
+        if !restart {
+            break;
+        }
+    }
+
+    CoUninitialize();
+}
+
+/// Inicializa e consome o `audio_client` até `stop_flag` ser acionado.
+/// Retorna `true` quando `should_restart` pede para recriar o cliente (ex.: Discord reiniciou).
+#[cfg(windows)]
+unsafe fn capture_until_stopped(
+    audio_client: &IAudioClient,
+    stop_flag: &AtomicBool,
+    pcm_tx: &Sender<(u32, Vec<i16>)>,
+    source_pid: u32,
+    should_restart: impl Fn() -> bool,
+) -> bool {
     let wave_format = WAVEFORMATEX {
         wFormatTag: 1, // WAVE_FORMAT_PCM
         nChannels: AUDIO_CHANNELS,
@@ -294,23 +420,28 @@ unsafe fn run_process_loopback_capture(
         )
         .is_err()
     {
-        CoUninitialize();
-        return;
+        return false;
     }
 
     let Ok(capture_client) = audio_client.GetService::<IAudioCaptureClient>() else {
-        CoUninitialize();
-        return;
+        return false;
     };
 
     if audio_client.Start().is_err() {
-        CoUninitialize();
-        return;
+        return false;
     }
 
     let mut accumulator: Vec<i16> = Vec::with_capacity(AUDIO_FRAME_SAMPLES * 2);
+    let mut last_restart_check = Instant::now();
 
     while !stop_flag.load(Ordering::Relaxed) {
+        if last_restart_check.elapsed() >= DISCORD_RESCAN_INTERVAL {
+            last_restart_check = Instant::now();
+            if should_restart() {
+                return true;
+            }
+        }
+
         let mut packet_length = capture_client.GetNextPacketSize().unwrap_or(0);
         if packet_length == 0 {
             thread::sleep(Duration::from_millis(2));
@@ -345,7 +476,7 @@ unsafe fn run_process_loopback_capture(
 
                 while accumulator.len() >= AUDIO_FRAME_SAMPLES {
                     let frame: Vec<i16> = accumulator.drain(..AUDIO_FRAME_SAMPLES).collect();
-                    let _ = pcm_tx.try_send((target_pid, frame));
+                    let _ = pcm_tx.try_send((source_pid, frame));
                 }
             } else {
                 break;
@@ -355,8 +486,7 @@ unsafe fn run_process_loopback_capture(
         }
     }
 
-    let _ = audio_client.Stop();
-    CoUninitialize();
+    false
 }
 
 /// 4.3. Reprodutor de Áudio WASAPI para o Espectador com controle de volume local em tempo real.
