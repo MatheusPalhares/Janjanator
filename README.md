@@ -11,6 +11,7 @@ Com o **Janjanator**, você e seus amigos continuam na call de voz do Discord no
 
 ## ⚡ Principais Recursos
 - **Áudio Isolado por Janela (`WASAPI Process Loopback`):** Captura apenas o som do jogo/janela escolhida. O som do Discord e do resto do Windows **não vaza** na live.
+- **Tela Inteira sem Eco do Discord:** Ao compartilhar o monitor inteiro, o áudio do Windows é transmitido **sem as vozes da call e os sons do Discord** (Stable, PTB e Canary detectados automaticamente). Pode ser desligado na tela de seleção da transmissão.
 - **60 FPS Reais (`Windows.Graphics.Capture` + Direct3D 11):** Captura direto da GPU com codificação paralela multi-core e bitrate adaptativo (**Auto**, **6 Mbps**, **12 Mbps**, **25 Mbps**).
 - **Zero Instalação para Amigos:** Um único arquivo portátil **`Janjanator.exe`** (~6 MB).
 - **Servidor SFU Embutido + Docker Self-Hosted:** Qualquer pessoa pode hostear uma sala (até 10 pessoas) direto pelo próprio `.exe` ou via `docker-compose up -d`.

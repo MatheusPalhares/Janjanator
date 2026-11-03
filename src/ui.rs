@@ -10,7 +10,7 @@ use egui::{
 };
 use rayon::prelude::*;
 
-use crate::capture_audio::{AudioPlaybackEngine, ProcessAudioCaptureSession};
+use crate::capture_audio::{AudioCaptureTarget, AudioPlaybackEngine, ProcessAudioCaptureSession};
 use crate::capture_video::{enumerate_monitors, enumerate_windows, VideoCaptureSession};
 use crate::codec::{detect_hardware_video_encoder, LowLatencyAudioEncoder, LowLatencyVideoEncoder};
 use crate::network::{NetworkEvent, OutgoingCommand, RoomNetworkClient};
@@ -44,6 +44,7 @@ pub struct ScreenShareApp {
     available_windows: Vec<CaptureTarget>,
     selected_target: Option<CaptureTarget>,
     share_window_audio: bool,
+    exclude_discord_audio: bool,
     selected_resolution: ResolutionPreset,
     selected_fps: FpsPreset,
     selected_bitrate: BitratePreset,
@@ -135,6 +136,7 @@ impl ScreenShareApp {
             available_windows: windows,
             selected_target: initial_target,
             share_window_audio: true,
+            exclude_discord_audio: true,
             selected_resolution: ResolutionPreset::Res1080p,
             selected_fps: FpsPreset::Fps60,
             selected_bitrate: BitratePreset::AutoAdaptive,
@@ -278,10 +280,17 @@ impl ScreenShareApp {
         } else {
             0
         };
+        let audio_target = if target.kind == CaptureTargetKind::Window {
+            AudioCaptureTarget::ProcessTree(target.pid)
+        } else {
+            AudioCaptureTarget::Desktop {
+                exclude_discord: self.exclude_discord_audio,
+            }
+        };
 
         let (audio_pcm_tx, audio_pcm_rx) = crossbeam_channel::bounded::<(u32, Vec<i16>)>(64);
         let audio_session = if self.share_window_audio {
-            Some(ProcessAudioCaptureSession::start(audio_pid, audio_pcm_tx))
+            Some(ProcessAudioCaptureSession::start(audio_target, audio_pcm_tx))
         } else {
             None
         };
@@ -1511,6 +1520,28 @@ impl ScreenShareApp {
                                     .size(11.5)
                                     .color(Color32::from_rgb(52, 211, 153)),
                                 );
+                            }
+                            if t.kind == CaptureTargetKind::Monitor && self.share_window_audio {
+                                ui.checkbox(
+                                    &mut self.exclude_discord_audio,
+                                    RichText::new(
+                                        "🔇 Excluir áudio do Discord ao compartilhar a tela inteira",
+                                    )
+                                    .size(12.5)
+                                    .color(Color32::from_rgb(147, 197, 253)),
+                                );
+                                let (hint, color) = if self.exclude_discord_audio {
+                                    (
+                                        "✔ Transmitindo o áudio do Windows (jogos, vídeos, apps), sem as vozes da call nem os sons do Discord.",
+                                        Color32::from_rgb(52, 211, 153),
+                                    )
+                                } else {
+                                    (
+                                        "⚠ Transmitindo TODO o áudio do Windows, incluindo vozes e sons do Discord (quem está na call vai ouvir eco).",
+                                        Color32::from_rgb(251, 191, 36),
+                                    )
+                                };
+                                ui.label(RichText::new(hint).size(11.5).color(color));
                             }
                         }
                     });

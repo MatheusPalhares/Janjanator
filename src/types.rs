@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const APP_VERSION: &str = match option_env!("JANJANATOR_BUILD_VERSION") {
     Some(v) => v,
-    None => "v0.6.6",
+    None => "v0.6.8",
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
