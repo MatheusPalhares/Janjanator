@@ -83,7 +83,7 @@ pub fn detect_hardware_video_encoder() -> String {
     }
 }
 
-/// Verifica rapidamente se uma faixa horizontal teve mudança visual real (ignorando ruído de dithering do DWM).
+/// Verifica rapidamente se uma faixa horizontal teve mudança visual real (ignorando ruído temporal/dithering do DWM).
 #[inline]
 fn band_has_visual_change(cur: &[u8], prev: &[u8]) -> bool {
     if cur.len() != prev.len() {
@@ -97,9 +97,9 @@ fn band_has_visual_change(cur: &[u8], prev: &[u8]) -> bool {
         let db = (cur[i] as i16 - prev[i] as i16).abs();
         let dg = (cur[i + 1] as i16 - prev[i + 1] as i16).abs();
         let dr = (cur[i + 2] as i16 - prev[i + 2] as i16).abs();
-        if db > 3 || dg > 3 || dr > 3 {
+        if db > 5 || dg > 5 || dr > 5 {
             changed_samples += 1;
-            if changed_samples >= 2 {
+            if changed_samples >= 4 {
                 return true;
             }
         }
@@ -109,7 +109,7 @@ fn band_has_visual_change(cur: &[u8], prev: &[u8]) -> bool {
 }
 
 /// 2.2. Codificador de Vídeo Multi-Core Paralelo com Bitrate Adaptativo ("Auto"),
-/// Rolling Band Refresh (auto-cura contínua sem picos de keyframe) e controle de congestionamento Fim-a-Fim.
+/// Rolling Band Refresh sob demanda e controle de estabilidade sem efeito gangorra.
 pub struct LowLatencyVideoEncoder {
     sender_id: String,
     sequence: u64,
@@ -124,6 +124,7 @@ pub struct LowLatencyVideoEncoder {
     bytes_in_window: u64,
     window_start: Instant,
     stable_frames_count: u32,
+    healing_frames_remaining: u8,
 }
 
 impl LowLatencyVideoEncoder {
@@ -150,6 +151,7 @@ impl LowLatencyVideoEncoder {
             bytes_in_window: 0,
             window_start: Instant::now(),
             stable_frames_count: 0,
+            healing_frames_remaining: 0,
         }
     }
 
@@ -157,16 +159,18 @@ impl LowLatencyVideoEncoder {
         &self.hw_encoder_name
     }
 
-    /// Ajusta dinamicamente a qualidade no máximo possível estável conforme folga de rede, RTT e feedback do espectador.
+    /// Ajusta dinamicamente a qualidade com zona morta (deadband) entre 10 e 16 Mbps para evitar efeito sanfona/picos de 50+ Mbps.
     pub fn notify_network_pressure(&mut self, queue_len: usize, rtt_ms: u64) {
         let _ = self.bitrate_preset;
-        let min_q: u8 = 68;
-        let max_q: u8 = 88;
+        let min_q: u8 = 65;
+        let max_q: u8 = 78;
 
         let congested_remote = self.viewer_congested.swap(false, Ordering::Relaxed);
         if congested_remote {
             self.adaptive_quality = self.adaptive_quality.saturating_sub(3).max(min_q);
             self.stable_frames_count = 0;
+            // Agenda 15 frames de rolling refresh para curar qualquer delta descartado no SFU
+            self.healing_frames_remaining = NUM_PARALLEL_BANDS as u8;
             return;
         }
 
@@ -177,12 +181,18 @@ impl LowLatencyVideoEncoder {
             self.adaptive_quality = self.adaptive_quality.saturating_sub(1).max(min_q + 2);
             self.stable_frames_count = 0;
         } else {
-            self.stable_frames_count += 1;
-            if self.stable_frames_count >= 18 {
-                self.stable_frames_count = 0;
-                if self.adaptive_quality < max_q {
-                    self.adaptive_quality += 1;
+            let live_kbps = self.current_kbps.load(Ordering::Relaxed);
+            // Só sobe qualidade se o bitrate atual estiver abaixo de 11 Mbps (impede subir para Q=88 e explodir para 50~80 Mbps!)
+            if live_kbps < 11_000 {
+                self.stable_frames_count += 1;
+                if self.stable_frames_count >= 30 {
+                    self.stable_frames_count = 0;
+                    if self.adaptive_quality < max_q {
+                        self.adaptive_quality += 1;
+                    }
                 }
+            } else {
+                self.stable_frames_count = 0;
             }
         }
     }
@@ -217,8 +227,16 @@ impl LowLatencyVideoEncoder {
         let num_bands = NUM_PARALLEL_BANDS.min(height as usize).max(1);
         let base_band_h = (height as usize) / num_bands;
         let stride = (width as usize) * 4;
-        // Rolling refresh: atualiza ciclicamente 1 faixa a cada frame para manter nitidez máxima contínua
-        let rolling_band = (self.sequence as usize) % num_bands;
+
+        // Rolling refresh inteligente: ativo durante auto-cura pós-congestionamento ou suavemente 1 faixa a cada 8 frames (~133ms)
+        let active_rolling_band = if self.healing_frames_remaining > 0 {
+            self.healing_frames_remaining -= 1;
+            Some((self.sequence as usize) % num_bands)
+        } else if self.sequence % 8 == 0 {
+            Some(((self.sequence / 8) as usize) % num_bands)
+        } else {
+            None
+        };
 
         struct BandTask<'a> {
             band_idx: u8,
@@ -244,7 +262,7 @@ impl LowLatencyVideoEncoder {
             prev_rem = rest;
 
             let src_slice = &bgra[(y_start * stride)..(y_end * stride)];
-            let force_encode = is_keyframe || b == rolling_band;
+            let force_encode = is_keyframe || active_rolling_band == Some(b);
 
             tasks.push(BandTask {
                 band_idx: b as u8,
@@ -307,17 +325,27 @@ impl LowLatencyVideoEncoder {
             let _ = raw_payload.write_all(&jpeg_bytes);
         }
 
-        // Medir bitrate real enviado na janela de 0.5s e manter no máximo estável
+        // Medir bitrate real enviado na janela de 0.5s com suavização e teto estável de 16 Mbps
         self.bytes_in_window += raw_payload.len() as u64;
         let elapsed_sec = self.window_start.elapsed().as_secs_f64();
         if elapsed_sec >= 0.5 {
-            let kbps = ((self.bytes_in_window as f64 * 8.0) / 1000.0 / elapsed_sec).round() as u32;
-            self.current_kbps.store(kbps.max(150), Ordering::Relaxed);
+            let instant_kbps =
+                ((self.bytes_in_window as f64 * 8.0) / 1000.0 / elapsed_sec).round() as u32;
+            let prev_kbps = self.current_kbps.load(Ordering::Relaxed);
+            let smoothed_kbps = if prev_kbps == 0 {
+                instant_kbps
+            } else {
+                (instant_kbps * 7 + prev_kbps * 3) / 10
+            };
+            self.current_kbps
+                .store(smoothed_kbps.max(50), Ordering::Relaxed);
             self.bytes_in_window = 0;
             self.window_start = Instant::now();
 
-            if kbps > 18_000 {
-                self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(68);
+            if instant_kbps > 16_000 {
+                self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(65);
+            } else if instant_kbps > 13_500 {
+                self.adaptive_quality = self.adaptive_quality.saturating_sub(1).max(65);
             }
         }
 

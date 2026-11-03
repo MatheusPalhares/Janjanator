@@ -83,7 +83,7 @@ pub enum BitratePreset {
 
 impl BitratePreset {
     pub fn bps(&self) -> u32 {
-        25_000_000
+        16_000_000
     }
 
     pub fn kbps(&self) -> u32 {
@@ -91,7 +91,7 @@ impl BitratePreset {
     }
 
     pub fn initial_quality(&self) -> u8 {
-        84
+        75
     }
 
     pub fn label(&self) -> &'static str {
