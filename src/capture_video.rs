@@ -560,6 +560,20 @@ fn run_capture_loop(
                 let (dst_w, dst_h) = resolution.target_dimensions(src_w, src_h);
                 let final_bgra = if dst_w == src_w && dst_h == src_h {
                     raw_bgra_buf.clone()
+                } else if dst_w == (src_w & !1) && dst_h == (src_h & !1) {
+                    // Se apenas 1 pixel de diferença (altura/largura ímpar de janela do Windows), recorta em 0ms sem redimensionar!
+                    let dst_stride = (dst_w as usize) * 4;
+                    let src_stride = (src_w as usize) * 4;
+                    if dst_stride == src_stride {
+                        raw_bgra_buf[..dst_stride * (dst_h as usize)].to_vec()
+                    } else {
+                        let mut cropped = vec![0u8; dst_stride * (dst_h as usize)];
+                        for y in 0..(dst_h as usize) {
+                            cropped[y * dst_stride..(y + 1) * dst_stride]
+                                .copy_from_slice(&raw_bgra_buf[y * src_stride..y * src_stride + dst_stride]);
+                        }
+                        cropped
+                    }
                 } else {
                     downscale_bgra_parallel(&raw_bgra_buf, src_w, src_h, dst_w, dst_h)
                 };
@@ -733,7 +747,8 @@ unsafe fn extract_dib_bits(
     }
 }
 
-/// 1.3. Redimensionamento paralelo multi-core (`rayon`) com verificação segura de limites (< 1ms para 1080p).
+/// 1.3. Redimensionamento bilinear paralelo ultra-rápido (< 1ms para 1080p via Rayon).
+/// Interpolação suave em ponto fixo 8-bit (sem divisões no loop interno) que preserva nitidez de texto sem serrilhar.
 pub fn downscale_bgra_parallel(
     src: &[u8],
     src_w: u32,
@@ -754,40 +769,47 @@ pub fn downscale_bgra_parallel(
 
     let mut dst = vec![0u8; dst_stride * dst_h];
 
-    // Filtro de área (box filter): cada pixel de destino é a média de TODOS os pixels de origem que ele cobre.
-    // O antigo vizinho-mais-próximo descartava linhas/colunas inteiras (ex: 1440p→1080p perdia 1 a cada 4),
-    // serrilhando textos e gerando "granulado" que o JPEG ainda amplificava.
-    let x_bounds: Vec<(usize, usize)> = (0..dst_w)
+    // Pré-calcula coordenadas X e fatores de interpolação em ponto fixo 8-bit (0..256)
+    let x_mapping: Vec<(usize, usize, u32, u32)> = (0..dst_w)
         .map(|x| {
-            let x0 = (x * src_w) / dst_w;
-            let x1 = (((x + 1) * src_w) / dst_w).max(x0 + 1).min(src_w);
-            (x0, x1)
+            let sx_fp = ((x * 256 * src_w) / dst_w) as u32;
+            let sx0 = (sx_fp >> 8) as usize;
+            let sx1 = (sx0 + 1).min(src_w - 1);
+            let fx = (sx_fp & 0xFF) as u32;
+            let inv_fx = 256 - fx;
+            (sx0 * 4, sx1 * 4, fx, inv_fx)
         })
         .collect();
+
+    let max_sy = src_h - 1;
 
     dst.par_chunks_mut(dst_stride)
         .enumerate()
         .for_each(|(y, dst_row)| {
-            let y0 = (y * src_h) / dst_h;
-            let y1 = (((y + 1) * src_h) / dst_h).max(y0 + 1).min(src_h);
-            for (x, &(x0, x1)) in x_bounds.iter().enumerate() {
-                let mut acc = [0u32; 4];
-                for sy in y0..y1 {
-                    let row = &src[sy * src_stride + x0 * 4..sy * src_stride + x1 * 4];
-                    for px in row.chunks_exact(4) {
-                        acc[0] += px[0] as u32;
-                        acc[1] += px[1] as u32;
-                        acc[2] += px[2] as u32;
-                        acc[3] += px[3] as u32;
-                    }
-                }
-                let n = ((y1 - y0) * (x1 - x0)) as u32;
-                let half = n / 2;
+            let sy_fp = ((y * 256 * src_h) / dst_h) as u32;
+            let sy0 = ((sy_fp >> 8) as usize).min(max_sy);
+            let sy1 = (sy0 + 1).min(max_sy);
+            let fy = (sy_fp & 0xFF) as u32;
+            let inv_fy = 256 - fy;
+
+            let row0 = &src[sy0 * src_stride..(sy0 + 1) * src_stride];
+            let row1 = &src[sy1 * src_stride..(sy1 + 1) * src_stride];
+
+            for (x, &(x0, x1, fx, inv_fx)) in x_mapping.iter().enumerate() {
+                let w00 = (inv_fx * inv_fy) >> 8;
+                let w10 = (fx * inv_fy) >> 8;
+                let w01 = (inv_fx * fy) >> 8;
+                let w11 = (fx * fy) >> 8;
+
                 let dx = x * 4;
-                dst_row[dx] = ((acc[0] + half) / n) as u8;
-                dst_row[dx + 1] = ((acc[1] + half) / n) as u8;
-                dst_row[dx + 2] = ((acc[2] + half) / n) as u8;
-                dst_row[dx + 3] = ((acc[3] + half) / n) as u8;
+                for c in 0..4 {
+                    let val = (row0[x0 + c] as u32 * w00
+                        + row0[x1 + c] as u32 * w10
+                        + row1[x0 + c] as u32 * w01
+                        + row1[x1 + c] as u32 * w11)
+                        >> 8;
+                    dst_row[dx + c] = val.min(255) as u8;
+                }
             }
         });
 

@@ -25,17 +25,17 @@ use windows::Win32::{
 
 const NUM_PARALLEL_BANDS: usize = 15;
 
-/// Faixa de qualidade JPEG do controle adaptativo para conteúdo em movimento.
-const ADAPTIVE_MIN_QUALITY: u8 = 70;
-const ADAPTIVE_MAX_QUALITY: u8 = 85;
+/// Faixa de qualidade JPEG do controle adaptativo para conteúdo em movimento (equilíbrio ideal 60 FPS).
+const ADAPTIVE_MIN_QUALITY: u8 = 72;
+const ADAPTIVE_MAX_QUALITY: u8 = 82;
 
 /// Refinamento progressivo de regiões estáticas (técnica usada por RDP/VNC/Parsec):
-/// quando uma faixa fica parada por alguns frames, ela é reenviada UMA vez em qualidade quase sem perdas,
-/// eliminando o "granulado"/mosquito noise em textos pequenos (abas, chat, HUD) sem custo contínuo de banda.
-const REFINE_QUALITY: u8 = 95;
-const REFINE_AFTER_STATIC_FRAMES: u16 = 6;
-/// Refina no máximo 1 faixa a cada N frames para diluir o pico de banda (15 faixas ≈ 0.5s a 60 FPS).
-const REFINE_EVERY_N_FRAMES: u64 = 2;
+/// quando uma faixa fica parada por alguns frames, ela é reenviada UMA vez em alta qualidade (86),
+/// eliminando o "granulado" e o bloom em textos pequenos sem sobrecarregar a CPU nem a rede.
+const REFINE_QUALITY: u8 = 86;
+const REFINE_AFTER_STATIC_FRAMES: u16 = 12;
+/// Refina no máximo 1 faixa a cada N frames para diluir suavemente o tráfego de rede (15 faixas ≈ 1.5s a 60 FPS).
+const REFINE_EVERY_N_FRAMES: u64 = 6;
 
 /// 2.2. Detecta o codificador de hardware H.264/AV1 disponível na GPU do Windows 11 via Media Foundation (`MFTEnumEx`).
 pub fn detect_hardware_video_encoder() -> String {
@@ -109,9 +109,9 @@ fn band_has_visual_change(cur: &[u8], prev: &[u8]) -> bool {
         let db = (cur[i] as i16 - prev[i] as i16).abs();
         let dg = (cur[i + 1] as i16 - prev[i + 1] as i16).abs();
         let dr = (cur[i + 2] as i16 - prev[i + 2] as i16).abs();
-        if db > 5 || dg > 5 || dr > 5 {
+        if db > 7 || dg > 7 || dr > 7 {
             changed_samples += 1;
-            if changed_samples >= 4 {
+            if changed_samples >= 8 {
                 return true;
             }
         }

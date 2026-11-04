@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use egui::{
     Align, Color32, ColorImage, Context, FontId, Frame, Key, Layout, Margin, RichText, Rounding,
-    ScrollArea, Sense, Stroke, TextureFilter, TextureHandle, TextureOptions, Vec2, ViewportCommand,
+    ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Vec2, ViewportCommand,
 };
 use rayon::prelude::*;
 
@@ -606,14 +606,7 @@ impl ScreenShareApp {
             return;
         }
         let color_image = ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
-
-        // Reduções fortes (ex: stream 1440p numa janela pequena) usam mipmaps trilineares para não "cintilar" o texto;
-        // em escala próxima de 1:1 mantém filtro linear puro (mais nítido).
-        let tex_options = if self.video_display_scale < 0.75 {
-            TextureOptions::LINEAR.with_mipmap_mode(Some(TextureFilter::Linear))
-        } else {
-            TextureOptions::LINEAR
-        };
+        let tex_options = TextureOptions::LINEAR;
 
         if let Some(ref mut tex) = self.video_texture {
             tex.set(color_image, tex_options);

@@ -91,7 +91,7 @@ impl BitratePreset {
     }
 
     pub fn initial_quality(&self) -> u8 {
-        80
+        78
     }
 
     pub fn label(&self) -> &'static str {

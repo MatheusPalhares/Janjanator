@@ -55,9 +55,6 @@ fn main() -> eframe::Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    // Iniciar o relay SFU embarcado caso este PC seja usado como Host direto
-    network::ensure_embedded_sfu_running();
-
     let icon_data = egui::IconData {
         rgba: JANJANATOR_ICON_RGBA.to_vec(),
         width: 64,
