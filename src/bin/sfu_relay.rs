@@ -137,6 +137,7 @@ fn send_ws_gated(
 }
 
 fn main() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     println!("=============================================================");
     println!("  Janjanator - Docker SFU Relay & Hub v2 (60fps)             ");
     println!("  - Zero-Copy Binary Relay  : 0.0.0.0:7890 (Max 10 Users)     ");

@@ -37,8 +37,9 @@ anyhow = "1.0"
 byteorder = "1.5"
 rand = "0.8"
 
-# WebSocket para sinalização LiveKit / SFU
-tungstenite = "0.24"
+# WebSocket para sinalização LiveKit / SFU (com suporte a TLS/WSS para Cloudflare Tunnels)
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 url = "2.5"
 
 # Interface Gráfica Nativa acelerada por GPU (OpenGL/WGL/DirectX via glow/eframe no Windows 11)

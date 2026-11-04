@@ -13,7 +13,9 @@ use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::WebSocket;
+use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{accept, Message};
 
 use crate::codec::{decode_audio_packet, VideoStreamDecoder};
@@ -248,15 +250,15 @@ impl RoomNetworkClient {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
-        let (host_str, port) = parse_server_endpoint(server_ip_input);
+        let endpoint = parse_server_endpoint(server_ip_input);
+        let event_tx_panic = event_tx.clone();
 
         thread::Builder::new()
             .name("sfu-network-client".to_string())
             .spawn(move || {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     run_network_worker(
-                        host_str,
-                        port,
+                        endpoint,
                         local_participant,
                         cmd_rx,
                         audio_rx,
@@ -267,6 +269,20 @@ impl RoomNetworkClient {
                         stop_clone,
                     );
                 }));
+                if let Err(panic_payload) = res {
+                    let err_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Panic não identificado na thread de rede".to_string()
+                    };
+                    eprintln!("[Network Worker Panic] {}", err_msg);
+                    let _ = event_tx_panic.send(NetworkEvent::Disconnected(format!(
+                        "Erro interno ao conectar: {}",
+                        err_msg
+                    )));
+                }
             })
             .expect("Falha ao criar thread de rede SFU");
 
@@ -312,9 +328,19 @@ impl Drop for RoomNetworkClient {
     }
 }
 
-fn parse_server_endpoint(input: &str) -> (String, u16) {
-    let trimmed = input
-        .trim()
+#[derive(Debug, Clone)]
+struct ParsedEndpoint {
+    host: String,
+    port: u16,
+    is_tls: bool,
+}
+
+fn parse_server_endpoint(input: &str) -> ParsedEndpoint {
+    let raw = input.trim();
+    let is_explicit_tls = raw.starts_with("https://") || raw.starts_with("wss://");
+    let is_explicit_plain = raw.starts_with("http://") || raw.starts_with("ws://") || raw.starts_with("tcp://");
+
+    let trimmed = raw
         .trim_start_matches("ws://")
         .trim_start_matches("wss://")
         .trim_start_matches("http://")
@@ -324,21 +350,40 @@ fn parse_server_endpoint(input: &str) -> (String, u16) {
     let host_port = trimmed.split('/').next().unwrap_or("").trim();
 
     if host_port.is_empty() {
-        return ("127.0.0.1".to_string(), DEFAULT_SFU_RELAY_PORT);
+        return ParsedEndpoint {
+            host: "127.0.0.1".to_string(),
+            port: DEFAULT_SFU_RELAY_PORT,
+            is_tls: false,
+        };
     }
 
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         if !host.is_empty() {
             if let Ok(custom_port) = port_str.trim().parse::<u16>() {
                 if custom_port > 0 {
-                    return (host.trim().to_string(), custom_port);
+                    let is_tls = is_explicit_tls || custom_port == 443;
+                    return ParsedEndpoint {
+                        host: host.trim().to_string(),
+                        port: custom_port,
+                        is_tls,
+                    };
                 }
             }
-            return (host.trim().to_string(), DEFAULT_SFU_RELAY_PORT);
         }
     }
 
-    (host_port.to_string(), DEFAULT_SFU_RELAY_PORT)
+    // Se não informou porta explícita:
+    // Domínios com ponto que NÃO sejam IPs numéricos (ex: live.teteucraft.com.br) ou com wss/https conectam via TLS na porta 443 (Cloudflare)
+    let is_numeric_ip = host_port.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let is_domain = host_port.contains('.') && !is_numeric_ip;
+    let is_tls = is_explicit_tls || (!is_explicit_plain && is_domain);
+    let default_port = if is_tls { 443 } else { DEFAULT_SFU_RELAY_PORT };
+
+    ParsedEndpoint {
+        host: host_port.to_string(),
+        port: default_port,
+        is_tls,
+    }
 }
 
 fn probe_livekit_port(host: &str, relay_port: u16) -> bool {
@@ -355,8 +400,7 @@ fn probe_livekit_port(host: &str, relay_port: u16) -> bool {
 }
 
 fn run_network_worker(
-    host: String,
-    port: u16,
+    endpoint: ParsedEndpoint,
     mut current_participant: ParticipantInfo,
     cmd_rx: Receiver<OutgoingCommand>,
     audio_rx: Receiver<Vec<u8>>,
@@ -366,14 +410,23 @@ fn run_network_worker(
     audio_pcm_tx: Sender<Vec<i16>>,
     stop_flag: Arc<AtomicBool>,
 ) {
+    let host = endpoint.host;
+    let port = endpoint.port;
+    let is_tls = endpoint.is_tls;
+
     let jwt_token = generate_livekit_jwt(
         &current_participant.identity,
         &current_participant.nickname,
         DEFAULT_ROOM_NAME,
     );
 
-    let livekit_reachable = probe_livekit_port(&host, port);
-    let ws_url = format!("ws://{}:{}/ws", host, port);
+    let livekit_reachable = if is_tls { true } else { probe_livekit_port(&host, port) };
+    let ws_scheme = if is_tls { "wss" } else { "ws" };
+    let ws_url = if (is_tls && port == 443) || (!is_tls && port == 80) {
+        format!("{}://{}/ws", ws_scheme, host)
+    } else {
+        format!("{}://{}:{}/ws", ws_scheme, host, port)
+    };
 
     // Iniciar thread dedicada de decodificação de vídeo para NUNCA bloquear o socket TCP
     let (vdec_tx, vdec_rx) = crossbeam_channel::bounded::<EncodedVideoPacket>(32);
@@ -417,7 +470,7 @@ fn run_network_worker(
     while !stop_flag.load(Ordering::Relaxed) {
         socket_busy.store(false, Ordering::Relaxed);
         let mut ws_conn = connect_ws_nonblocking(&ws_url);
-        if ws_conn.is_none()
+        if ws_conn.is_err()
             && port == DEFAULT_SFU_RELAY_PORT
             && (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"))
         {
@@ -426,20 +479,23 @@ fn run_network_worker(
             ws_conn = connect_ws_nonblocking(&ws_url);
         }
 
-        let Some(mut socket) = ws_conn else {
-            if first_connect {
-                let _ = event_tx.send(NetworkEvent::Disconnected(format!(
-                    "Não foi possível conectar em {}:{}. Verifique o IP ZeroTier/Playit e o Docker.",
-                    host, port
-                )));
-                return;
-            } else {
-                let _ = event_tx.send(NetworkEvent::Reconnecting(format!(
-                    "Reconectando a {}:{}...",
-                    host, port
-                )));
-                thread::sleep(Duration::from_millis(400));
-                continue;
+        let mut socket = match ws_conn {
+            Ok(s) => s,
+            Err(err_msg) => {
+                if first_connect {
+                    let _ = event_tx.send(NetworkEvent::Disconnected(format!(
+                        "Erro ao conectar em {}:{}: {}",
+                        host, port, err_msg
+                    )));
+                    return;
+                } else {
+                    let _ = event_tx.send(NetworkEvent::Reconnecting(format!(
+                        "Reconectando a {}:{}... ({})",
+                        host, port, err_msg
+                    )));
+                    thread::sleep(Duration::from_millis(400));
+                    continue;
+                }
             }
         };
 
@@ -516,7 +572,7 @@ fn run_network_worker(
                         if let Some(bin) =
                             SfuControlMessage::UpdateParticipant(info).to_wire_bytes()
                         {
-                            if !send_ws_gated(&mut socket, bin, &mut pending_flush) {
+                            if !send_ws_client_gated(&mut socket, bin, &mut pending_flush) {
                                 connection_alive = false;
                                 break;
                             }
@@ -534,7 +590,7 @@ fn run_network_worker(
                             },
                         };
                         if let Some(bin) = ctrl.to_wire_bytes() {
-                            if !send_ws_gated(&mut socket, bin, &mut pending_flush) {
+                            if !send_ws_client_gated(&mut socket, bin, &mut pending_flush) {
                                 connection_alive = false;
                                 break;
                             }
@@ -542,14 +598,14 @@ fn run_network_worker(
                     }
                     OutgoingCommand::PublishVideo(packet) => {
                         let bin = packet.to_wire_bytes();
-                        if !send_ws_gated(&mut socket, bin, &mut pending_flush) {
+                        if !send_ws_client_gated(&mut socket, bin, &mut pending_flush) {
                             connection_alive = false;
                             break;
                         }
                     }
                     OutgoingCommand::PublishAudio(packet) => {
                         let bin = packet.to_wire_bytes();
-                        if !send_ws_gated(&mut socket, bin, &mut pending_flush) {
+                        if !send_ws_client_gated(&mut socket, bin, &mut pending_flush) {
                             connection_alive = false;
                             break;
                         }
@@ -571,7 +627,7 @@ fn run_network_worker(
                     break;
                 };
                 did_work = true;
-                if !send_ws_gated(&mut socket, audio_bin, &mut pending_flush) {
+                if !send_ws_client_gated(&mut socket, audio_bin, &mut pending_flush) {
                     connection_alive = false;
                     break;
                 }
@@ -587,7 +643,7 @@ fn run_network_worker(
                     break;
                 };
                 did_work = true;
-                if !send_ws_gated(&mut socket, video_bin, &mut pending_flush) {
+                if !send_ws_client_gated(&mut socket, video_bin, &mut pending_flush) {
                     connection_alive = false;
                     break;
                 }
@@ -603,7 +659,7 @@ fn run_network_worker(
                     .unwrap_or_default()
                     .as_millis() as u64;
                 if let Some(bin) = SfuControlMessage::Ping(now_ms).to_wire_bytes() {
-                    let _ = send_ws_gated(&mut socket, bin, &mut pending_flush);
+                    let _ = send_ws_client_gated(&mut socket, bin, &mut pending_flush);
                 }
             }
 
@@ -701,6 +757,29 @@ fn run_network_worker(
 }
 
 /// Envia uma mensagem binária com controle estrito de `pending_flush` para impedir bufferbloat.
+fn send_ws_client_gated(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    data: Vec<u8>,
+    pending_flush: &mut bool,
+) -> bool {
+    match socket.send(Message::Binary(data)) {
+        Ok(()) => {
+            *pending_flush = false;
+            true
+        }
+        Err(tungstenite::Error::Io(ref err))
+            if err.kind() == ErrorKind::WouldBlock
+                || err.kind() == ErrorKind::TimedOut
+                || err.kind() == ErrorKind::Interrupted =>
+        {
+            *pending_flush = true;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Envia uma mensagem binária no servidor SFU local
 fn send_ws_gated(
     socket: &mut WebSocket<TcpStream>,
     data: Vec<u8>,
@@ -723,19 +802,29 @@ fn send_ws_gated(
     }
 }
 
-fn connect_ws_nonblocking(ws_url: &str) -> Option<WebSocket<TcpStream>> {
-    let parsed = url::Url::parse(ws_url).ok()?;
-    let host = parsed.host_str()?;
-    let port = parsed.port().unwrap_or(DEFAULT_SFU_RELAY_PORT);
-    let addr_str = format!("{}:{}", host, port);
-    let mut addrs = std::net::ToSocketAddrs::to_socket_addrs(&addr_str).ok()?;
-    let sock_addr = addrs.next()?;
+fn connect_ws_nonblocking(ws_url: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let tcp = TcpStream::connect_timeout(&sock_addr, Duration::from_millis(3500)).ok()?;
-    let _ = tcp.set_nodelay(true);
-    let (socket, _resp) = tungstenite::client::client(ws_url, tcp).ok()?;
-    let _ = socket.get_ref().set_nonblocking(true);
-    Some(socket)
+    let req = ws_url
+        .into_client_request()
+        .map_err(|e| format!("URL WebSocket inválida ({}): {}", ws_url, e))?;
+
+    let (mut socket, _resp) = tungstenite::connect(req)
+        .map_err(|e| format!("Falha no handshake WebSocket ({}): {}", ws_url, e))?;
+
+    // Configura o socket TCP subjacente (seja TLS ou Plain TCP) como non-blocking
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(tcp) => {
+            let _ = tcp.set_nodelay(true);
+            let _ = tcp.set_nonblocking(true);
+        }
+        MaybeTlsStream::Rustls(tls) => {
+            let _ = tls.get_mut().set_nodelay(true);
+            let _ = tls.get_mut().set_nonblocking(true);
+        }
+        _ => {}
+    }
+    Ok(socket)
 }
 
 struct ClientPeer {

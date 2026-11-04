@@ -30,3 +30,13 @@ services:
       - LIVEKIT_URL=ws://livekit-server:7880
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY:-APIScreenSharePrivateKey}
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET:-SecretScreenShareKeyForFriends2026Win11Native!}
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: screenshare-cloudflared
+    restart: unless-stopped
+    depends_on:
+      - screenshare-hub
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    environment:
+      - TUNNEL_METRICS=0.0.0.0:2000

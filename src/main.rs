@@ -22,6 +22,9 @@ extern "system" {
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // Inicializar o provedor criptográfico Ring para o Rustls (TLS/WSS dos Túneis Cloudflare)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Ativar precisão de timer de 1ms no kernel do Windows (evita o sleep padrão de 15.6ms que derruba 60 FPS para 30~40 FPS)
     #[cfg(windows)]
     unsafe {
