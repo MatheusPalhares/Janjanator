@@ -6,6 +6,7 @@
 # Environment files with local secrets (keep .env.example versioned)
 .env.local
 .env
+img/example-screenshare/
 
 # OS / IDE files
 .DS_Store

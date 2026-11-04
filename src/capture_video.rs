@@ -753,21 +753,41 @@ pub fn downscale_bgra_parallel(
     }
 
     let mut dst = vec![0u8; dst_stride * dst_h];
-    let x_ratio = (src_w << 16) / dst_w;
-    let y_ratio = (src_h << 16) / dst_h;
-    let max_sx = (src_w - 1) * 4;
+
+    // Filtro de área (box filter): cada pixel de destino é a média de TODOS os pixels de origem que ele cobre.
+    // O antigo vizinho-mais-próximo descartava linhas/colunas inteiras (ex: 1440p→1080p perdia 1 a cada 4),
+    // serrilhando textos e gerando "granulado" que o JPEG ainda amplificava.
+    let x_bounds: Vec<(usize, usize)> = (0..dst_w)
+        .map(|x| {
+            let x0 = (x * src_w) / dst_w;
+            let x1 = (((x + 1) * src_w) / dst_w).max(x0 + 1).min(src_w);
+            (x0, x1)
+        })
+        .collect();
 
     dst.par_chunks_mut(dst_stride)
         .enumerate()
         .for_each(|(y, dst_row)| {
-            let sy = ((y * y_ratio) >> 16).min(src_h - 1);
-            let src_row = &src[sy * src_stride..(sy + 1) * src_stride];
-            let mut sx_fp = 0usize;
-            for x in 0..dst_w {
-                let sx = ((sx_fp >> 16) * 4).min(max_sx);
+            let y0 = (y * src_h) / dst_h;
+            let y1 = (((y + 1) * src_h) / dst_h).max(y0 + 1).min(src_h);
+            for (x, &(x0, x1)) in x_bounds.iter().enumerate() {
+                let mut acc = [0u32; 4];
+                for sy in y0..y1 {
+                    let row = &src[sy * src_stride + x0 * 4..sy * src_stride + x1 * 4];
+                    for px in row.chunks_exact(4) {
+                        acc[0] += px[0] as u32;
+                        acc[1] += px[1] as u32;
+                        acc[2] += px[2] as u32;
+                        acc[3] += px[3] as u32;
+                    }
+                }
+                let n = ((y1 - y0) * (x1 - x0)) as u32;
+                let half = n / 2;
                 let dx = x * 4;
-                dst_row[dx..dx + 4].copy_from_slice(&src_row[sx..sx + 4]);
-                sx_fp += x_ratio;
+                dst_row[dx] = ((acc[0] + half) / n) as u8;
+                dst_row[dx + 1] = ((acc[1] + half) / n) as u8;
+                dst_row[dx + 2] = ((acc[2] + half) / n) as u8;
+                dst_row[dx + 3] = ((acc[3] + half) / n) as u8;
             }
         });
 

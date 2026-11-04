@@ -25,6 +25,18 @@ use windows::Win32::{
 
 const NUM_PARALLEL_BANDS: usize = 15;
 
+/// Faixa de qualidade JPEG do controle adaptativo para conteúdo em movimento.
+const ADAPTIVE_MIN_QUALITY: u8 = 70;
+const ADAPTIVE_MAX_QUALITY: u8 = 85;
+
+/// Refinamento progressivo de regiões estáticas (técnica usada por RDP/VNC/Parsec):
+/// quando uma faixa fica parada por alguns frames, ela é reenviada UMA vez em qualidade quase sem perdas,
+/// eliminando o "granulado"/mosquito noise em textos pequenos (abas, chat, HUD) sem custo contínuo de banda.
+const REFINE_QUALITY: u8 = 95;
+const REFINE_AFTER_STATIC_FRAMES: u16 = 6;
+/// Refina no máximo 1 faixa a cada N frames para diluir o pico de banda (15 faixas ≈ 0.5s a 60 FPS).
+const REFINE_EVERY_N_FRAMES: u64 = 2;
+
 /// 2.2. Detecta o codificador de hardware H.264/AV1 disponível na GPU do Windows 11 via Media Foundation (`MFTEnumEx`).
 pub fn detect_hardware_video_encoder() -> String {
     #[cfg(windows)]
@@ -125,6 +137,13 @@ pub struct LowLatencyVideoEncoder {
     window_start: Instant,
     stable_frames_count: u32,
     healing_frames_remaining: u8,
+    /// Frames consecutivos sem mudança visual por faixa.
+    band_static_frames: Vec<u16>,
+    /// Faixa já foi reenviada em alta qualidade desde a última mudança.
+    band_refined: Vec<bool>,
+    /// Bytes de conteúdo em movimento (exclui refinamentos) usados pelo controle adaptativo.
+    controller_bytes_in_window: u64,
+    controller_kbps: u32,
 }
 
 impl LowLatencyVideoEncoder {
@@ -152,6 +171,10 @@ impl LowLatencyVideoEncoder {
             window_start: Instant::now(),
             stable_frames_count: 0,
             healing_frames_remaining: 0,
+            band_static_frames: Vec::new(),
+            band_refined: Vec::new(),
+            controller_bytes_in_window: 0,
+            controller_kbps: 0,
         }
     }
 
@@ -162,8 +185,8 @@ impl LowLatencyVideoEncoder {
     /// Ajusta dinamicamente a qualidade com zona morta (deadband) entre 10 e 16 Mbps para evitar efeito sanfona/picos de 50+ Mbps.
     pub fn notify_network_pressure(&mut self, queue_len: usize, rtt_ms: u64) {
         let _ = self.bitrate_preset;
-        let min_q: u8 = 65;
-        let max_q: u8 = 78;
+        let min_q: u8 = ADAPTIVE_MIN_QUALITY;
+        let max_q: u8 = ADAPTIVE_MAX_QUALITY;
 
         let congested_remote = self.viewer_congested.swap(false, Ordering::Relaxed);
         if congested_remote {
@@ -181,7 +204,8 @@ impl LowLatencyVideoEncoder {
             self.adaptive_quality = self.adaptive_quality.saturating_sub(1).max(min_q + 2);
             self.stable_frames_count = 0;
         } else {
-            let live_kbps = self.current_kbps.load(Ordering::Relaxed);
+            // Usa apenas o bitrate de conteúdo em movimento (refinamentos estáticos são picos pontuais)
+            let live_kbps = self.controller_kbps;
             // Só sobe qualidade se o bitrate atual estiver abaixo de 11 Mbps (impede subir para Q=88 e explodir para 50~80 Mbps!)
             if live_kbps < 11_000 {
                 self.stable_frames_count += 1;
@@ -228,7 +252,17 @@ impl LowLatencyVideoEncoder {
         let base_band_h = (height as usize) / num_bands;
         let stride = (width as usize) * 4;
 
+        if dims_changed || self.band_static_frames.len() != num_bands {
+            self.band_static_frames = vec![0; num_bands];
+            self.band_refined = vec![false; num_bands];
+        }
+        if is_keyframe {
+            // Keyframe vai em qualidade adaptativa (evita pico gigante); o refinamento reconstrói a nitidez em ~0.5s
+            self.band_refined.iter_mut().for_each(|r| *r = false);
+        }
+
         // Rolling refresh inteligente: ativo durante auto-cura pós-congestionamento ou suavemente 1 faixa a cada 8 frames (~133ms)
+        let healing_active = self.healing_frames_remaining > 0;
         let active_rolling_band = if self.healing_frames_remaining > 0 {
             self.healing_frames_remaining -= 1;
             Some((self.sequence as usize) % num_bands)
@@ -238,11 +272,26 @@ impl LowLatencyVideoEncoder {
             None
         };
 
+        // Escolhe 1 faixa estática ainda não refinada para reenviar em alta qualidade (rotacionando o ponto de partida)
+        let refine_band: Option<usize> = if !is_keyframe
+            && !healing_active
+            && self.sequence % REFINE_EVERY_N_FRAMES == 0
+        {
+            let start = (self.sequence as usize / REFINE_EVERY_N_FRAMES as usize) % num_bands;
+            (0..num_bands).map(|i| (start + i) % num_bands).find(|&b| {
+                !self.band_refined[b] && self.band_static_frames[b] >= REFINE_AFTER_STATIC_FRAMES
+            })
+        } else {
+            None
+        };
+
         struct BandTask<'a> {
             band_idx: u8,
             y_start: u32,
             band_h: u32,
             force_encode: bool,
+            is_refine: bool,
+            quality: u8,
             src_slice: &'a [u8],
             prev_slice: &'a mut [u8],
         }
@@ -262,30 +311,42 @@ impl LowLatencyVideoEncoder {
             prev_rem = rest;
 
             let src_slice = &bgra[(y_start * stride)..(y_end * stride)];
-            let force_encode = is_keyframe || active_rolling_band == Some(b);
+            let is_refine = refine_band == Some(b);
+            let force_encode = is_keyframe || is_refine || active_rolling_band == Some(b);
+            // Rolling refresh de uma faixa já refinada mantém a qualidade alta (não degrada texto parado)
+            let band_quality = if is_refine || (!is_keyframe && self.band_refined[b]) {
+                REFINE_QUALITY
+            } else {
+                quality
+            };
 
             tasks.push(BandTask {
                 band_idx: b as u8,
                 y_start: y_start as u32,
                 band_h: band_h as u32,
                 force_encode,
+                is_refine,
+                quality: band_quality,
                 src_slice,
                 prev_slice: prev_band,
             });
         }
 
         // Detectar mudança visual, atualizar cache prev_bgra e codificar JPEG simultaneamente em todos os núcleos via Rayon!
-        let encoded_bands: Vec<(u8, u32, u32, Vec<u8>)> = tasks
+        // Retorno: (band_idx, y_start, band_h, jpeg, mudou_visualmente, foi_refinamento, qualidade_usada)
+        let encoded_bands: Vec<(u8, u32, u32, Vec<u8>, bool, bool, u8)> = tasks
             .into_par_iter()
             .filter_map(|task| {
-                let changed = if task.force_encode {
-                    true
-                } else {
-                    band_has_visual_change(task.src_slice, task.prev_slice)
-                };
-                if !changed {
+                let visually_changed = band_has_visual_change(task.src_slice, task.prev_slice);
+                if !visually_changed && !task.force_encode {
                     return None;
                 }
+                // Conteúdo mudou durante o refinamento: volta para a qualidade adaptativa de movimento
+                let band_quality = if visually_changed && task.is_refine {
+                    quality
+                } else {
+                    task.quality
+                };
 
                 task.prev_slice.copy_from_slice(task.src_slice);
 
@@ -303,21 +364,57 @@ impl LowLatencyVideoEncoder {
                 let mut jpeg_buf = Vec::with_capacity(pixel_count / 4);
                 {
                     let mut cursor = Cursor::new(&mut jpeg_buf);
-                    let mut encoder = JpegEncoder::new_with_quality(&mut cursor, quality);
+                    let mut encoder = JpegEncoder::new_with_quality(&mut cursor, band_quality);
                     encoder
                         .encode(&rgb, width, task.band_h, ColorType::Rgb8.into())
                         .ok()?;
                 }
 
-                Some((task.band_idx, task.y_start, task.band_h, jpeg_buf))
+                Some((
+                    task.band_idx,
+                    task.y_start,
+                    task.band_h,
+                    jpeg_buf,
+                    visually_changed,
+                    task.is_refine,
+                    band_quality,
+                ))
             })
             .collect();
 
+        // Atualizar o estado de refinamento por faixa
+        let mut encoded_mask = vec![false; num_bands];
+        let mut refine_bytes: u64 = 0;
+        for (band_idx, _, _, jpeg, changed, was_refine, used_q) in &encoded_bands {
+            let b = *band_idx as usize;
+            encoded_mask[b] = true;
+            if *changed {
+                self.band_static_frames[b] = 0;
+                self.band_refined[b] = false;
+            } else {
+                self.band_static_frames[b] = self.band_static_frames[b].saturating_add(1);
+                if *was_refine && *used_q == REFINE_QUALITY {
+                    self.band_refined[b] = true;
+                }
+                if *used_q == REFINE_QUALITY {
+                    refine_bytes += jpeg.len() as u64;
+                }
+            }
+        }
+        for (b, encoded) in encoded_mask.iter().enumerate() {
+            if !encoded {
+                self.band_static_frames[b] = self.band_static_frames[b].saturating_add(1);
+            }
+        }
+
         // Empacotamento binário direto das faixas JPEG
-        let total_jpeg_bytes: usize = encoded_bands.iter().map(|(_, _, _, b)| b.len() + 13).sum();
+        let total_jpeg_bytes: usize = encoded_bands
+            .iter()
+            .map(|(_, _, _, b, _, _, _)| b.len() + 13)
+            .sum();
         let mut raw_payload = Vec::with_capacity(1 + total_jpeg_bytes);
         let _ = raw_payload.write_u8(encoded_bands.len() as u8);
-        for (band_idx, y_start, band_h, jpeg_bytes) in encoded_bands {
+        for (band_idx, y_start, band_h, jpeg_bytes, _, _, _) in encoded_bands {
             let _ = raw_payload.write_u8(band_idx);
             let _ = raw_payload.write_u32::<LittleEndian>(y_start);
             let _ = raw_payload.write_u32::<LittleEndian>(band_h);
@@ -327,10 +424,14 @@ impl LowLatencyVideoEncoder {
 
         // Medir bitrate real enviado na janela de 0.5s com suavização e teto estável de 16 Mbps
         self.bytes_in_window += raw_payload.len() as u64;
+        self.controller_bytes_in_window += (raw_payload.len() as u64).saturating_sub(refine_bytes);
         let elapsed_sec = self.window_start.elapsed().as_secs_f64();
         if elapsed_sec >= 0.5 {
             let instant_kbps =
                 ((self.bytes_in_window as f64 * 8.0) / 1000.0 / elapsed_sec).round() as u32;
+            let motion_kbps = ((self.controller_bytes_in_window as f64 * 8.0) / 1000.0
+                / elapsed_sec)
+                .round() as u32;
             let prev_kbps = self.current_kbps.load(Ordering::Relaxed);
             let smoothed_kbps = if prev_kbps == 0 {
                 instant_kbps
@@ -339,13 +440,26 @@ impl LowLatencyVideoEncoder {
             };
             self.current_kbps
                 .store(smoothed_kbps.max(50), Ordering::Relaxed);
+            self.controller_kbps = if self.controller_kbps == 0 {
+                motion_kbps
+            } else {
+                (motion_kbps * 7 + self.controller_kbps * 3) / 10
+            };
             self.bytes_in_window = 0;
+            self.controller_bytes_in_window = 0;
             self.window_start = Instant::now();
 
-            if instant_kbps > 16_000 {
-                self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(65);
-            } else if instant_kbps > 13_500 {
-                self.adaptive_quality = self.adaptive_quality.saturating_sub(1).max(65);
+            // Teto de banda considera apenas conteúdo em movimento (refinamento é pontual e se auto-limita)
+            if motion_kbps > 16_000 {
+                self.adaptive_quality = self
+                    .adaptive_quality
+                    .saturating_sub(2)
+                    .max(ADAPTIVE_MIN_QUALITY);
+            } else if motion_kbps > 13_500 {
+                self.adaptive_quality = self
+                    .adaptive_quality
+                    .saturating_sub(1)
+                    .max(ADAPTIVE_MIN_QUALITY);
             }
         }
 

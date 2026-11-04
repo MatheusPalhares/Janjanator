@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use egui::{
     Align, Color32, ColorImage, Context, FontId, Frame, Key, Layout, Margin, RichText, Rounding,
-    ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Vec2, ViewportCommand,
+    ScrollArea, Sense, Stroke, TextureFilter, TextureHandle, TextureOptions, Vec2, ViewportCommand,
 };
 use rayon::prelude::*;
 
@@ -71,6 +71,8 @@ pub struct ScreenShareApp {
     is_fullscreen: bool,
     app_logo_texture: Option<TextureHandle>,
     video_texture: Option<TextureHandle>,
+    /// Escala física com que o vídeo está sendo exibido (1.0 = pixel-a-pixel); < 0.75 ativa mipmaps anti-serrilhado.
+    video_display_scale: f32,
     last_frame_resolution: (u32, u32),
     last_frame_encoder: String,
     fps_counter_frames: u32,
@@ -161,6 +163,7 @@ impl ScreenShareApp {
             is_fullscreen: false,
             app_logo_texture,
             video_texture: None,
+            video_display_scale: 1.0,
             last_frame_resolution: (0, 0),
             last_frame_encoder: String::new(),
             fps_counter_frames: 0,
@@ -604,11 +607,19 @@ impl ScreenShareApp {
         }
         let color_image = ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
 
+        // Reduções fortes (ex: stream 1440p numa janela pequena) usam mipmaps trilineares para não "cintilar" o texto;
+        // em escala próxima de 1:1 mantém filtro linear puro (mais nítido).
+        let tex_options = if self.video_display_scale < 0.75 {
+            TextureOptions::LINEAR.with_mipmap_mode(Some(TextureFilter::Linear))
+        } else {
+            TextureOptions::LINEAR
+        };
+
         if let Some(ref mut tex) = self.video_texture {
-            tex.set(color_image, TextureOptions::LINEAR);
+            tex.set(color_image, tex_options);
         } else {
             self.video_texture =
-                Some(ctx.load_texture("stream-video", color_image, TextureOptions::LINEAR));
+                Some(ctx.load_texture("stream-video", color_image, tex_options));
         }
 
         self.last_frame_resolution = (frame.width, frame.height);
@@ -1139,6 +1150,8 @@ impl ScreenShareApp {
                         || (self.is_publishing && self.show_self_preview));
 
                 if has_active_video {
+                    // Em tela cheia o cabeçalho é ocultado para o vídeo ocupar a tela inteira em escala 1:1 (ESC sai)
+                    if !self.is_fullscreen {
                     ui.horizontal(|ui| {
                         let (w, h) = self.last_frame_resolution;
                         ui.label(
@@ -1201,35 +1214,62 @@ impl ScreenShareApp {
                     });
 
                     ui.add_space(6.0);
+                    }
 
                     if let Some(ref tex) = self.video_texture {
                         let avail = ui.available_size();
                         let tex_size = tex.size_vec2();
+                        let ppp = ctx.pixels_per_point().max(0.1);
                         let aspect = if tex_size.y > 0.0 {
                             tex_size.x / tex_size.y
                         } else {
                             16.0 / 9.0
                         };
 
-                        let mut draw_w = avail.x;
-                        let mut draw_h = draw_w / aspect;
-                        if draw_h > avail.y {
-                            draw_h = avail.y;
-                            draw_w = draw_h * aspect;
-                        }
+                        // Tamanho do frame em "points" para exibição pixel-a-pixel (1 pixel do stream = 1 pixel da tela)
+                        let native_w = tex_size.x / ppp;
+                        let native_h = tex_size.y / ppp;
 
-                        ui.centered_and_justified(|ui| {
-                            let response = ui.add(
-                                egui::Image::new((tex.id(), Vec2::new(draw_w, draw_h)))
-                                    .sense(Sense::click()),
-                            );
-                            if response.double_clicked() {
-                                self.is_fullscreen = !self.is_fullscreen;
-                                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(
-                                    self.is_fullscreen,
-                                ));
+                        let (draw_w, draw_h) = if native_w <= avail.x && native_h <= avail.y {
+                            // Cabe inteiro: exibe em 1:1 sem reamostragem (máxima nitidez de texto)
+                            (native_w, native_h)
+                        } else {
+                            let mut w = avail.x;
+                            let mut h = w / aspect;
+                            if h > avail.y {
+                                h = avail.y;
+                                w = h * aspect;
                             }
-                        });
+                            (w, h)
+                        };
+                        self.video_display_scale = if tex_size.x > 0.0 {
+                            (draw_w * ppp) / tex_size.x
+                        } else {
+                            1.0
+                        };
+
+                        let (area_rect, response) =
+                            ui.allocate_exact_size(avail, Sense::click());
+                        // Alinha o canto do vídeo à grade de pixels físicos para evitar borrão de meio-pixel
+                        let center = area_rect.center();
+                        let min_x = ((center.x - draw_w / 2.0) * ppp).round() / ppp;
+                        let min_y = ((center.y - draw_h / 2.0) * ppp).round() / ppp;
+                        let img_rect = egui::Rect::from_min_size(
+                            egui::pos2(min_x, min_y),
+                            Vec2::new(draw_w, draw_h),
+                        );
+                        ui.painter().image(
+                            tex.id(),
+                            img_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        if response.double_clicked() {
+                            self.is_fullscreen = !self.is_fullscreen;
+                            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(
+                                self.is_fullscreen,
+                            ));
+                        }
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
