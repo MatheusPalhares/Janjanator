@@ -25,6 +25,13 @@ fn main() -> eframe::Result<()> {
     // Inicializar o provedor criptográfico Ring para o Rustls (TLS/WSS dos Túneis Cloudflare)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Limitar o pool global do Rayon a 4 threads dedicadas: codifica/decodifica 1080p em < 1.2ms
+    // sem acordar e girar (spin-wait) todas as 16 threads de CPUs Ryzen 7 a cada tick de 60 FPS!
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .thread_name(|i| format!("janjan-simd-{}", i))
+        .build_global();
+
     // Ativar precisão de timer de 1ms no kernel do Windows (evita o sleep padrão de 15.6ms que derruba 60 FPS para 30~40 FPS)
     #[cfg(windows)]
     unsafe {

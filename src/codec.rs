@@ -261,13 +261,18 @@ impl LowLatencyVideoEncoder {
             self.band_refined.iter_mut().for_each(|r| *r = false);
         }
 
-        // Rolling refresh inteligente: ativo durante auto-cura pós-congestionamento ou suavemente 1 faixa a cada 8 frames (~133ms)
+        // Rolling refresh inteligente: ativo durante auto-cura pós-congestionamento ou em faixas ainda não refinadas
         let healing_active = self.healing_frames_remaining > 0;
         let active_rolling_band = if self.healing_frames_remaining > 0 {
             self.healing_frames_remaining -= 1;
             Some((self.sequence as usize) % num_bands)
         } else if self.sequence % 8 == 0 {
-            Some(((self.sequence / 8) as usize) % num_bands)
+            let candidate = ((self.sequence / 8) as usize) % num_bands;
+            if !self.band_refined[candidate] {
+                Some(candidate)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -407,6 +412,26 @@ impl LowLatencyVideoEncoder {
             }
         }
 
+        // Se nenhuma faixa precisou ser codificada neste tick (tela estática já refinada),
+        // atualiza a janela de medição e não envia pacote vazio (poupa 100% da CPU/GPU do espectador!)
+        if encoded_bands.is_empty() {
+            let elapsed_sec = self.window_start.elapsed().as_secs_f64();
+            if elapsed_sec >= 0.5 {
+                let instant_kbps =
+                    ((self.bytes_in_window as f64 * 8.0) / 1000.0 / elapsed_sec).round() as u32;
+                let motion_kbps = ((self.controller_bytes_in_window as f64 * 8.0) / 1000.0
+                    / elapsed_sec)
+                    .round() as u32;
+                self.current_kbps
+                    .store(instant_kbps.max(50), Ordering::Relaxed);
+                self.controller_kbps = motion_kbps;
+                self.bytes_in_window = 0;
+                self.controller_bytes_in_window = 0;
+                self.window_start = Instant::now();
+            }
+            return None;
+        }
+
         // Empacotamento binário direto das faixas JPEG
         let total_jpeg_bytes: usize = encoded_bands
             .iter()
@@ -504,6 +529,9 @@ impl VideoStreamDecoder {
         }
         let mut cur = Cursor::new(data);
         let band_count = cur.read_u8().ok()? as usize;
+        if band_count == 0 {
+            return None;
+        }
 
         let width = packet.width;
         let height = packet.height;
@@ -563,6 +591,7 @@ impl VideoStreamDecoder {
         }
 
         Some(DecodedVideoFrame {
+            sender: packet.sender.clone(),
             width,
             height,
             hw_encoder_name: packet.hw_encoder_name.clone(),

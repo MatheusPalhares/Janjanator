@@ -8,7 +8,6 @@ use egui::{
     Align, Color32, ColorImage, Context, FontId, Frame, Key, Layout, Margin, RichText, Rounding,
     ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Vec2, ViewportCommand,
 };
-use rayon::prelude::*;
 
 use crate::capture_audio::{AudioCaptureTarget, AudioPlaybackEngine, ProcessAudioCaptureSession};
 use crate::capture_video::{enumerate_monitors, enumerate_windows, VideoCaptureSession};
@@ -179,7 +178,7 @@ impl ScreenShareApp {
         }
     }
 
-    fn connect_to_server(&mut self) {
+    fn connect_to_server(&mut self, ctx: &Context) {
         if self.nickname.trim().is_empty() {
             self.status_message = "Informe um Nickname válido.".to_string();
             return;
@@ -190,13 +189,20 @@ impl ScreenShareApp {
         let player = AudioPlaybackEngine::start(pcm_rx, self.watching_local_volume_pct);
 
         let local_info = self.build_local_participant_info();
-        let client = RoomNetworkClient::connect(&self.server_ip, local_info, net_tx, pcm_tx.clone());
+        let client = RoomNetworkClient::connect(
+            &self.server_ip,
+            local_info,
+            net_tx,
+            pcm_tx.clone(),
+            ctx.clone(),
+        );
 
         self.net_client = Some(client);
         self.net_event_rx = Some(net_rx);
         self.audio_player = Some(player);
         self.audio_pcm_tx = Some(pcm_tx);
         self.status_message = format!("Conectando a {}...", self.server_ip);
+        ctx.request_repaint();
     }
 
     fn disconnect_from_server(&mut self) {
@@ -260,7 +266,7 @@ impl ScreenShareApp {
         }
     }
 
-    fn start_publishing(&mut self) {
+    fn start_publishing(&mut self, ctx: &Context) {
         let Some(target) = self.selected_target.clone() else {
             self.status_message = "Selecione um monitor ou janela para compartilhar.".to_string();
             return;
@@ -311,6 +317,7 @@ impl ScreenShareApp {
         let rtt_atomic = self.latency_atomic.clone();
         let want_preview = self.want_self_preview_atomic.clone();
         let net_client_ref = self.net_client.as_ref().map(|c| c.inner_sender());
+        let ui_ctx_preview = ctx.clone();
 
         // Thread dedicada de codificação de Áudio (100% isolada do encoder de vídeo 1080p!)
         let stop_audio_enc = stop_flag.clone();
@@ -355,7 +362,7 @@ impl ScreenShareApp {
 
                     while !stop_clone.load(Ordering::Relaxed) {
                         // Aguardar evento de vídeo com wakeup instantâneo (< 0.01ms)
-                        let first_ev = match cap_rx.recv_timeout(Duration::from_millis(4)) {
+                        let first_ev = match cap_rx.recv_timeout(Duration::from_millis(8)) {
                             Ok(ev) => Some(ev),
                             Err(_) => None,
                         };
@@ -390,6 +397,7 @@ impl ScreenShareApp {
                             width,
                             height,
                             bgra,
+                            is_duplicate,
                         }) = latest_cap
                         {
                             if let Some(ref tx) = net_client_ref {
@@ -408,22 +416,32 @@ impl ScreenShareApp {
                                 }
                             }
 
-                            // Prévia local na taxa exata selecionada (30 ou 60 FPS), sem divisor de frames!
-                            if want_preview.load(Ordering::Relaxed) && !preview_tx.is_full() {
+                            // Prévia local atualiza apenas quando há novo frame real da GPU (!is_duplicate),
+                            // usando loop linear auto-vetorizado (AVX2) sem acordar 16 threads do Rayon!
+                            if !is_duplicate
+                                && want_preview.load(Ordering::Relaxed)
+                                && !preview_tx.is_full()
+                            {
                                 let mut rgba = vec![255u8; bgra.len()];
-                                rgba.par_chunks_exact_mut(4)
-                                    .zip(bgra.par_chunks_exact(4))
-                                    .for_each(|(dst, src)| {
-                                        dst[0] = src[2];
-                                        dst[1] = src[1];
-                                        dst[2] = src[0];
-                                    });
-                                let _ = preview_tx.try_send(DecodedVideoFrame {
-                                    width,
-                                    height,
-                                    hw_encoder_name: v_encoder.hw_encoder_name().to_string(),
-                                    rgba,
-                                });
+                                for (dst, src) in
+                                    rgba.chunks_exact_mut(4).zip(bgra.chunks_exact(4))
+                                {
+                                    dst[0] = src[2];
+                                    dst[1] = src[1];
+                                    dst[2] = src[0];
+                                }
+                                if preview_tx
+                                    .try_send(DecodedVideoFrame {
+                                        sender: String::new(),
+                                        width,
+                                        height,
+                                        hw_encoder_name: v_encoder.hw_encoder_name().to_string(),
+                                        rgba,
+                                    })
+                                    .is_ok()
+                                {
+                                    ui_ctx_preview.request_repaint();
+                                }
                             }
                         }
                     }
@@ -441,6 +459,9 @@ impl ScreenShareApp {
         self.show_share_modal = false;
 
         let updated = self.build_local_participant_info();
+        if let Some( me_slot ) = self.participants.iter_mut().find(|p| p.identity == self.my_identity) {
+            *me_slot = updated.clone();
+        }
         if let Some(ref client) = self.net_client {
             client.update_participant(updated);
         }
@@ -452,6 +473,7 @@ impl ScreenShareApp {
             self.selected_fps.value(),
             self.selected_bitrate.label()
         );
+        ctx.request_repaint();
     }
 
     fn stop_publishing(&mut self) {
@@ -469,13 +491,30 @@ impl ScreenShareApp {
         self.active_target_title.clear();
         self.active_audio_pid = 0;
 
-        if let Some(ref client) = self.net_client {
-            client.update_participant(self.build_local_participant_info());
+        if self.watching_identity.is_none() {
+            self.video_texture = None;
+            self.measured_fps = 0;
+            self.fps_counter_frames = 0;
         }
+
+        let updated = self.build_local_participant_info();
+        if let Some(me_slot) = self
+            .participants
+            .iter_mut()
+            .find(|p| p.identity == self.my_identity)
+        {
+            *me_slot = updated.clone();
+        }
+        if let Some(ref client) = self.net_client {
+            client.update_participant(updated);
+        }
+        self.status_message = "Transmissão encerrada.".to_string();
     }
 
     fn start_watching(&mut self, host_identity: String) {
         self.watching_identity = Some(host_identity.clone());
+        self.video_texture = None;
+        self.measured_fps = 0;
         self.want_self_preview_atomic.store(false, Ordering::Relaxed);
         self.fps_counter_frames = 0;
         self.fps_counter_instant = Instant::now();
@@ -487,6 +526,8 @@ impl ScreenShareApp {
     fn stop_watching(&mut self) {
         self.watching_identity = None;
         self.video_texture = None;
+        self.measured_fps = 0;
+        self.fps_counter_frames = 0;
         self.want_self_preview_atomic
             .store(self.show_self_preview, Ordering::Relaxed);
         if let Some(ref client) = self.net_client {
@@ -495,13 +536,15 @@ impl ScreenShareApp {
     }
 
     fn process_events(&mut self, ctx: &Context) {
-        // Atualizar flag atômica de self-preview
-        let should_preview = self.watching_identity.is_none() && self.show_self_preview;
+        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+
+        // Atualizar flag atômica de self-preview (desativa automaticamente quando minimizado para poupar CPU/RAM)
+        let should_preview =
+            self.watching_identity.is_none() && self.show_self_preview && !is_minimized;
         self.want_self_preview_atomic
             .store(should_preview, Ordering::Relaxed);
 
         // Economizar banda quando minimizado (5.3)
-        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         if self.auto_pause_when_minimized {
             if is_minimized && self.watching_identity.is_some() {
                 let current = self.watching_identity.clone();
@@ -558,10 +601,28 @@ impl ScreenShareApp {
                     self.status_message = msg;
                 }
                 NetworkEvent::Disconnected(reason) => {
+                    self.stop_watching();
                     self.is_connected = false;
                     self.status_message = reason;
                 }
                 NetworkEvent::ParticipantsUpdated(list) => {
+                    // Se estávamos assistindo alguém e esse host parou de transmitir ou saiu da sala,
+                    // encerrar a visualização imediatamente para nunca deixar um frame congelado na tela!
+                    if let Some(watched_id) = self.watching_identity.clone() {
+                        let still_streaming = list
+                            .iter()
+                            .any(|p| p.identity == watched_id && p.is_streaming);
+                        if !still_streaming {
+                            self.stop_watching();
+                            latest_remote_video = None;
+                            if self.is_fullscreen {
+                                self.is_fullscreen = false;
+                                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+                            }
+                            self.status_message =
+                                "A transmissão foi encerrada pelo host.".to_string();
+                        }
+                    }
                     self.participants = list;
                 }
                 NetworkEvent::KeyframeRequested => {
@@ -575,8 +636,10 @@ impl ScreenShareApp {
                     self.latency_atomic.store(rtt as u32, Ordering::Relaxed);
                 }
                 NetworkEvent::RemoteAudioFrame { samples } => {
-                    if let Some(ref pcm_tx) = self.audio_pcm_tx {
-                        let _ = pcm_tx.try_send(samples);
+                    if self.watching_identity.is_some() {
+                        if let Some(ref pcm_tx) = self.audio_pcm_tx {
+                            let _ = pcm_tx.try_send(samples);
+                        }
                     }
                 }
                 NetworkEvent::RemoteVideoFrame(_) => {}
@@ -584,7 +647,9 @@ impl ScreenShareApp {
         }
 
         if let Some(frame) = latest_remote_video {
-            self.upload_video_frame(ctx, frame, remote_frames_in_tick.max(1));
+            if self.watching_identity.as_deref() == Some(frame.sender.as_str()) {
+                self.upload_video_frame(ctx, frame, remote_frames_in_tick.max(1));
+            }
         } else if self.watching_identity.is_none() && self.is_publishing && self.show_self_preview {
             let mut latest_preview = None;
             let mut preview_frames_in_tick: u32 = 0;
@@ -632,11 +697,12 @@ impl eframe::App for ScreenShareApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.process_events(ctx);
 
-        // Repaint imediato para 60+ FPS sem trava artificial de timer
+        // Os workers de rede/decodificador acordam a GUI instantaneamente via ctx.request_repaint()
+        // a cada frame decodificado (60 FPS) ou evento de sala; o timer abaixo é apenas fallback!
         if self.is_publishing || self.watching_identity.is_some() {
-            ctx.request_repaint();
+            ctx.request_repaint_after(Duration::from_millis(16));
         } else {
-            ctx.request_repaint_after(Duration::from_millis(50));
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         if !self.is_connected {
@@ -739,7 +805,7 @@ impl ScreenShareApp {
                         );
 
                         if connect_btn.clicked() || enter_pressed {
-                            self.connect_to_server();
+                            self.connect_to_server(ctx);
                         }
 
                         ui.add_space(10.0);
@@ -1086,6 +1152,25 @@ impl ScreenShareApp {
                                         {
                                             self.stop_watching();
                                         }
+
+                                        ui.add_space(4.0);
+                                        let mut vol = self.watching_local_volume_pct;
+                                        ui.spacing_mut().slider_width = 145.0;
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut vol, 0..=200)
+                                                    .step_by(1.0)
+                                                    .smart_aim(false)
+                                                    .text("🔊")
+                                                    .suffix("%"),
+                                            )
+                                            .changed()
+                                        {
+                                            self.watching_local_volume_pct = vol;
+                                            if let Some(ref player) = self.audio_player {
+                                                player.set_volume_percent(vol);
+                                            }
+                                        }
                                     } else if ui
                                         .add_sized(
                                             [ui.available_width(), 28.0],
@@ -1189,9 +1274,12 @@ impl ScreenShareApp {
                                 ui.add_space(10.0);
 
                                 let mut vol = self.watching_local_volume_pct;
+                                ui.spacing_mut().slider_width = 160.0;
                                 if ui
                                     .add(
                                         egui::Slider::new(&mut vol, 0..=200)
+                                            .step_by(1.0)
+                                            .smart_aim(false)
                                             .text("🔊 Volume")
                                             .suffix("%"),
                                     )
@@ -1685,7 +1773,7 @@ impl ScreenShareApp {
                         )
                         .clicked()
                     {
-                        self.start_publishing();
+                        self.start_publishing(ctx);
                     }
 
                     ui.add_space(10.0);

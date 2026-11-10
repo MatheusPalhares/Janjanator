@@ -262,9 +262,7 @@ impl VideoCaptureSession {
 
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
-        }
+        let _ = self.worker.take();
     }
 }
 
@@ -507,6 +505,7 @@ fn run_capture_loop(
 
         let mut raw_bgra_buf: Vec<u8> = Vec::new();
         let mut last_scaled_cache: Option<(u32, u32, Vec<u8>)> = None;
+        let mut idle_ticks: u32 = 0;
         let mut next_tick = Instant::now();
 
         while !stop_flag.load(Ordering::Relaxed) {
@@ -536,18 +535,9 @@ fn run_capture_loop(
             let mut raw_dims = (0u32, 0u32);
 
             if let Some(ref mut engine) = wgc_engine {
-                // Tentar pegar o frame imediatamente; poll curto de 450us para não roubar CPU do encoder
-                let poll_deadline = Instant::now() + Duration::from_micros(450);
-                loop {
-                    if let Some((w, h)) = engine.try_grab_latest_frame(&mut raw_bgra_buf) {
-                        got_new_gpu_frame = true;
-                        raw_dims = (w, h);
-                        break;
-                    }
-                    if Instant::now() >= poll_deadline {
-                        break;
-                    }
-                    thread::yield_now();
+                if let Some((w, h)) = engine.try_grab_latest_frame(&mut raw_bgra_buf) {
+                    got_new_gpu_frame = true;
+                    raw_dims = (w, h);
                 }
             } else if let Some((w, h, gdi_data)) = capture_fallback_gdi(&target) {
                 raw_bgra_buf = gdi_data;
@@ -556,6 +546,7 @@ fn run_capture_loop(
             }
 
             if got_new_gpu_frame {
+                idle_ticks = 0;
                 let (src_w, src_h) = raw_dims;
                 let (dst_w, dst_h) = resolution.target_dimensions(src_w, src_h);
                 let final_bgra = if dst_w == src_w && dst_h == src_h {
@@ -584,26 +575,31 @@ fn run_capture_loop(
                     width: dst_w,
                     height: dst_h,
                     bgra: final_bgra,
+                    is_duplicate: false,
                 });
             } else if let Some((dst_w, dst_h, ref cached)) = last_scaled_cache {
-                // Mantém cadência exata de 30/60 FPS mesmo quando o DWM não redesenhou a janela no tick
-                let _ = event_tx.try_send(CaptureEvent::FrameCaptured {
-                    width: dst_w,
-                    height: dst_h,
-                    bgra: cached.clone(),
-                });
+                idle_ticks = idle_ticks.wrapping_add(1);
+                // Quando o DWM não redesenhou a janela no tick, envia o cache em metade da taxa apenas
+                // para alimentar o refinamento estático progressivo e pedidos de keyframe sem clonar 8.3 MB a 60 Hz
+                if idle_ticks % 2 == 0 {
+                    let _ = event_tx.try_send(CaptureEvent::FrameCaptured {
+                        width: dst_w,
+                        height: dst_h,
+                        bgra: cached.clone(),
+                        is_duplicate: true,
+                    });
+                }
             }
 
             next_tick += frame_interval;
             let now = Instant::now();
             if next_tick > now {
                 let wait = next_tick - now;
-                // Com timeBeginPeriod(1) ativo em main.rs, o sleep do Windows tem precisão de ~1ms.
-                // Dormir até faltar 2ms libera 100% dos núcleos para o codificador Rayon manter 60 FPS cravados!
-                if wait > Duration::from_millis(3) {
-                    thread::sleep(wait - Duration::from_millis(2));
+                // Com timeBeginPeriod(1) ativo em main.rs, dorme até faltar ~0.9ms para economizar CPU mantendo 60 FPS cravados
+                if wait > Duration::from_micros(1400) {
+                    thread::sleep(wait - Duration::from_micros(900));
                 }
-                while Instant::now() + Duration::from_micros(250) < next_tick {
+                while Instant::now() + Duration::from_micros(150) < next_tick {
                     thread::yield_now();
                 }
                 while Instant::now() < next_tick {

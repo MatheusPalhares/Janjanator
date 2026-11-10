@@ -296,6 +296,7 @@ impl EncodedAudioPacket {
 
 #[derive(Debug, Clone)]
 pub struct DecodedVideoFrame {
+    pub sender: String,
     pub width: u32,
     pub height: u32,
     pub hw_encoder_name: String,
@@ -308,6 +309,7 @@ pub enum CaptureEvent {
         width: u32,
         height: u32,
         bgra: Vec<u8>,
+        is_duplicate: bool,
     },
     TargetMinimized,
     TargetRestored,

@@ -45,7 +45,7 @@ const DISCORD_PROCESS_NAMES: &[&str] = &[
 ];
 
 /// Intervalo para verificar se o Discord foi aberto, fechado ou reiniciado durante a transmissão.
-const DISCORD_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
+const DISCORD_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// O que deve ser capturado pelo WASAPI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,9 +98,7 @@ impl ProcessAudioCaptureSession {
 
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
-        }
+        let _ = self.worker.take();
     }
 }
 
@@ -444,7 +442,7 @@ unsafe fn capture_until_stopped(
 
         let mut packet_length = capture_client.GetNextPacketSize().unwrap_or(0);
         if packet_length == 0 {
-            thread::sleep(Duration::from_millis(2));
+            thread::sleep(Duration::from_millis(4));
             continue;
         }
 
@@ -528,9 +526,7 @@ impl AudioPlaybackEngine {
 
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
-        }
+        let _ = self.worker.take();
     }
 }
 

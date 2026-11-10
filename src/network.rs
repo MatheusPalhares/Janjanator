@@ -240,6 +240,7 @@ impl RoomNetworkClient {
         local_participant: ParticipantInfo,
         event_tx: Sender<NetworkEvent>,
         audio_pcm_tx: Sender<Vec<i16>>,
+        ui_ctx: eframe::egui::Context,
     ) -> Self {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<OutgoingCommand>(32);
         let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
@@ -252,6 +253,7 @@ impl RoomNetworkClient {
         let stop_clone = stop_flag.clone();
         let endpoint = parse_server_endpoint(server_ip_input);
         let event_tx_panic = event_tx.clone();
+        let ui_ctx_panic = ui_ctx.clone();
 
         thread::Builder::new()
             .name("sfu-network-client".to_string())
@@ -267,6 +269,7 @@ impl RoomNetworkClient {
                         event_tx,
                         audio_pcm_tx,
                         stop_clone,
+                        ui_ctx,
                     );
                 }));
                 if let Err(panic_payload) = res {
@@ -282,6 +285,7 @@ impl RoomNetworkClient {
                         "Erro interno ao conectar: {}",
                         err_msg
                     )));
+                    ui_ctx_panic.request_repaint();
                 }
             })
             .expect("Falha ao criar thread de rede SFU");
@@ -386,6 +390,7 @@ fn parse_server_endpoint(input: &str) -> ParsedEndpoint {
     }
 }
 
+#[allow(dead_code)]
 fn probe_livekit_port(host: &str, relay_port: u16) -> bool {
     if relay_port != DEFAULT_SFU_RELAY_PORT {
         return true;
@@ -409,6 +414,7 @@ fn run_network_worker(
     event_tx: Sender<NetworkEvent>,
     audio_pcm_tx: Sender<Vec<i16>>,
     stop_flag: Arc<AtomicBool>,
+    ui_ctx: eframe::egui::Context,
 ) {
     let host = endpoint.host;
     let port = endpoint.port;
@@ -420,7 +426,8 @@ fn run_network_worker(
         DEFAULT_ROOM_NAME,
     );
 
-    let livekit_reachable = if is_tls { true } else { probe_livekit_port(&host, port) };
+    // Conectar diretamente ao WebSocket sem bloquear 500ms testando a porta 7880 antes!
+    let livekit_reachable = true;
     let ws_scheme = if is_tls { "wss" } else { "ws" };
     let ws_url = if (is_tls && port == 443) || (!is_tls && port == 80) {
         format!("{}://{}/ws", ws_scheme, host)
@@ -428,10 +435,14 @@ fn run_network_worker(
         format!("{}://{}:{}/ws", ws_scheme, host, port)
     };
 
+    let watched_host_shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let watched_for_vdec = watched_host_shared.clone();
+
     // Iniciar thread dedicada de decodificação de vídeo para NUNCA bloquear o socket TCP
     let (vdec_tx, vdec_rx) = crossbeam_channel::bounded::<EncodedVideoPacket>(32);
     let event_tx_vdec = event_tx.clone();
     let stop_vdec = stop_flag.clone();
+    let ui_ctx_vdec = ui_ctx.clone();
     thread::Builder::new()
         .name("video-decoder-worker".to_string())
         .spawn(move || {
@@ -441,12 +452,18 @@ fn run_network_worker(
                     let Ok(mut pkt) = vdec_rx.recv_timeout(Duration::from_millis(50)) else {
                         continue;
                     };
+                    if watched_for_vdec.lock().as_deref() != Some(pkt.sender.as_str()) {
+                        continue;
+                    }
                     // Só fundir frames intermediários se houver atraso real acumulado (>3 frames na fila);
                     // em rajadas normais de 2 pacotes do TCP/ZeroTier, emite cada frame individualmente para manter 60 FPS!
                     while vdec_rx.len() > 3 {
                         let Ok(next_pkt) = vdec_rx.try_recv() else {
                             break;
                         };
+                        if watched_for_vdec.lock().as_deref() != Some(next_pkt.sender.as_str()) {
+                            continue;
+                        }
                         if next_pkt.is_keyframe {
                             pkt = next_pkt;
                         } else {
@@ -454,8 +471,15 @@ fn run_network_worker(
                             pkt = next_pkt;
                         }
                     }
-                    if let Some(frame) = decoder.decode_packet(&pkt) {
-                        let _ = event_tx_vdec.try_send(NetworkEvent::RemoteVideoFrame(frame));
+                    if watched_for_vdec.lock().as_deref() == Some(pkt.sender.as_str()) {
+                        if let Some(frame) = decoder.decode_packet(&pkt) {
+                            if event_tx_vdec
+                                .try_send(NetworkEvent::RemoteVideoFrame(frame))
+                                .is_ok()
+                            {
+                                ui_ctx_vdec.request_repaint();
+                            }
+                        }
                     }
                 }
             }));
@@ -487,12 +511,14 @@ fn run_network_worker(
                         "Erro ao conectar em {}:{}: {}",
                         host, port, err_msg
                     )));
+                    ui_ctx.request_repaint();
                     return;
                 } else {
                     let _ = event_tx.send(NetworkEvent::Reconnecting(format!(
                         "Reconectando a {}:{}... ({})",
                         host, port, err_msg
                     )));
+                    ui_ctx.request_repaint();
                     thread::sleep(Duration::from_millis(400));
                     continue;
                 }
@@ -520,6 +546,7 @@ fn run_network_worker(
                 let _ = socket.send(Message::Binary(bin));
             }
         }
+        let _ = socket.flush();
 
         if first_connect {
             first_connect = false;
@@ -528,6 +555,7 @@ fn run_network_worker(
                 jwt_token: jwt_token.clone(),
                 livekit_reachable,
             });
+            ui_ctx.request_repaint();
         }
 
         let mut last_ping = Instant::now();
@@ -576,10 +604,12 @@ fn run_network_worker(
                                 connection_alive = false;
                                 break;
                             }
+                            let _ = socket.flush();
                         }
                     }
                     OutgoingCommand::SubscribeToHost(target) => {
                         watched_host = target.clone();
+                        *watched_host_shared.lock() = target.clone();
                         let ctrl = match target {
                             Some(host_id) => SfuControlMessage::SubscribeStream {
                                 viewer_identity: my_identity.clone(),
@@ -594,6 +624,7 @@ fn run_network_worker(
                                 connection_alive = false;
                                 break;
                             }
+                            let _ = socket.flush();
                         }
                     }
                     OutgoingCommand::PublishVideo(packet) => {
@@ -612,6 +643,7 @@ fn run_network_worker(
                     }
                     OutgoingCommand::Disconnect => {
                         let _ = socket.close(None);
+                        let _ = socket.flush();
                         return;
                     }
                 }
@@ -696,6 +728,7 @@ fn run_network_worker(
                                             let _ = event_tx.send(
                                                 NetworkEvent::ParticipantsUpdated(participants),
                                             );
+                                            ui_ctx.request_repaint();
                                         }
                                         SfuControlMessage::RequestKeyframe {
                                             target_host_identity,
@@ -749,8 +782,8 @@ fn run_network_worker(
             }
 
             if !did_work {
-                // Evitar thread::sleep(1ms) no Windows (que dorme 15.6ms e derruba o FPS para 30~40!)
-                thread::yield_now();
+                // Com timeBeginPeriod(1) ativo em main.rs, sleep(1ms) acorda a 1000 Hz sem gastar 100% de um núcleo da CPU!
+                thread::sleep(Duration::from_millis(1));
             }
         }
     }
@@ -1026,8 +1059,18 @@ fn handle_embedded_peer(
                                 SfuControlMessage::UpdateParticipant(info) => {
                                     {
                                         let mut map = peers_ref.lock();
-                                        if let Some(peer) = map.get_mut(&info.identity) {
+                                        let host_id = info.identity.clone();
+                                        let stopped_streaming = !info.is_streaming;
+                                        if let Some(peer) = map.get_mut(&host_id) {
                                             peer.info = info;
+                                        }
+                                        if stopped_streaming {
+                                            for peer in map.values_mut() {
+                                                if peer.watching.as_deref() == Some(host_id.as_str()) {
+                                                    peer.watching = None;
+                                                    while peer.video_rx.try_recv().is_ok() {}
+                                                }
+                                            }
                                         }
                                     }
                                     broadcast_room_state(&peers_ref);
@@ -1040,6 +1083,7 @@ fn handle_embedded_peer(
                                     {
                                         let mut map = peers_ref.lock();
                                         if let Some(viewer) = map.get_mut(&viewer_identity) {
+                                            while viewer.video_rx.try_recv().is_ok() {}
                                             viewer.watching = Some(target_host_identity.clone());
                                         }
                                         if let Some(host) = map.get(&target_host_identity) {
@@ -1060,6 +1104,7 @@ fn handle_embedded_peer(
                                     let mut map = peers_ref.lock();
                                     if let Some(viewer) = map.get_mut(&viewer_identity) {
                                         viewer.watching = None;
+                                        while viewer.video_rx.try_recv().is_ok() {}
                                     }
                                 }
                                 SfuControlMessage::Ping(ts) => {
@@ -1099,7 +1144,7 @@ fn handle_embedded_peer(
         }
 
         if !active {
-            thread::sleep(Duration::from_micros(400));
+            thread::sleep(Duration::from_millis(1));
         }
     }
 }

@@ -361,8 +361,18 @@ fn handle_peer_connection(
                                 SfuControlMessage::UpdateParticipant(info) => {
                                     {
                                         let mut map = peers_ref.lock();
-                                        if let Some(peer) = map.get_mut(&info.identity) {
+                                        let host_id = info.identity.clone();
+                                        let stopped_streaming = !info.is_streaming;
+                                        if let Some(peer) = map.get_mut(&host_id) {
                                             peer.info = info;
+                                        }
+                                        if stopped_streaming {
+                                            for peer in map.values_mut() {
+                                                if peer.watching.as_deref() == Some(host_id.as_str()) {
+                                                    peer.watching = None;
+                                                    while peer.video_rx.try_recv().is_ok() {}
+                                                }
+                                            }
                                         }
                                     }
                                     broadcast_room_state(&peers_ref);
@@ -375,6 +385,7 @@ fn handle_peer_connection(
                                     {
                                         let mut map = peers_ref.lock();
                                         if let Some(viewer) = map.get_mut(&viewer_identity) {
+                                            while viewer.video_rx.try_recv().is_ok() {}
                                             viewer.watching = Some(target_host_identity.clone());
                                         }
                                         if let Some(host) = map.get(&target_host_identity) {
@@ -395,6 +406,7 @@ fn handle_peer_connection(
                                     let mut map = peers_ref.lock();
                                     if let Some(viewer) = map.get_mut(&viewer_identity) {
                                         viewer.watching = None;
+                                        while viewer.video_rx.try_recv().is_ok() {}
                                     }
                                 }
                                 SfuControlMessage::Ping(ts) => {
@@ -436,7 +448,7 @@ fn handle_peer_connection(
         }
 
         if !active {
-            thread::sleep(Duration::from_micros(400));
+            thread::sleep(Duration::from_millis(1));
         }
     }
 }
