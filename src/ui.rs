@@ -12,7 +12,7 @@ use egui::{
 use crate::capture_audio::{AudioCaptureTarget, AudioPlaybackEngine, ProcessAudioCaptureSession};
 use crate::capture_video::{enumerate_monitors, enumerate_windows, VideoCaptureSession};
 use crate::codec::{detect_hardware_video_encoder, LowLatencyAudioEncoder, LowLatencyVideoEncoder};
-use crate::network::{NetworkEvent, OutgoingCommand, RoomNetworkClient};
+use crate::network::{NetworkEvent, RemoteVideoSlot, RoomNetworkClient};
 use crate::types::{
     BitratePreset, CaptureEvent, CaptureTarget, CaptureTargetKind, DecodedVideoFrame, FpsPreset,
     ParticipantInfo, ResolutionPreset, APP_VERSION,
@@ -33,6 +33,8 @@ pub struct ScreenShareApp {
     // Cliente de Rede e Sala (4.1 - 4.3)
     net_client: Option<RoomNetworkClient>,
     net_event_rx: Option<Receiver<NetworkEvent>>,
+    remote_video_slot: Arc<RemoteVideoSlot>,
+    local_preview_recycle: Arc<parking_lot::Mutex<Option<Vec<u8>>>>,
     participants: Vec<ParticipantInfo>,
 
     // Modal de Compartilhar Tela Aprimorado (5.2)
@@ -128,6 +130,8 @@ impl ScreenShareApp {
 
             net_client: None,
             net_event_rx: None,
+            remote_video_slot: Arc::new(RemoteVideoSlot::new()),
+            local_preview_recycle: Arc::new(parking_lot::Mutex::new(None)),
             participants: Vec::new(),
 
             show_share_modal: false,
@@ -184,7 +188,15 @@ impl ScreenShareApp {
             return;
         }
 
-        let (net_tx, net_rx) = crossbeam_channel::bounded::<NetworkEvent>(256);
+        // Garantir que qualquer tentativa de conexão anterior seja encerrada antes de abrir outra
+        if self.net_client.is_some() || self.audio_player.is_some() {
+            self.disconnect_from_server();
+        }
+
+        self.remote_video_slot.clear();
+        self.remote_video_slot.mark_ui_active();
+
+        let (net_tx, net_rx) = crossbeam_channel::bounded::<NetworkEvent>(64);
         let (pcm_tx, pcm_rx) = crossbeam_channel::bounded::<Vec<i16>>(128);
         let player = AudioPlaybackEngine::start(pcm_rx, self.watching_local_volume_pct);
 
@@ -194,6 +206,7 @@ impl ScreenShareApp {
             local_info,
             net_tx,
             pcm_tx.clone(),
+            self.remote_video_slot.clone(),
             ctx.clone(),
         );
 
@@ -316,6 +329,7 @@ impl ScreenShareApp {
         let kbps_atomic = self.live_measured_kbps.clone();
         let rtt_atomic = self.latency_atomic.clone();
         let want_preview = self.want_self_preview_atomic.clone();
+        let preview_recycle = self.local_preview_recycle.clone();
         let net_client_ref = self.net_client.as_ref().map(|c| c.inner_sender());
         let ui_ctx_preview = ctx.clone();
 
@@ -417,18 +431,25 @@ impl ScreenShareApp {
                             }
 
                             // Prévia local atualiza apenas quando há novo frame real da GPU (!is_duplicate),
-                            // usando loop linear auto-vetorizado (AVX2) sem acordar 16 threads do Rayon!
+                            // reciclando o buffer Vec<u8> (0 alocações por frame!) e usando loop linear auto-vetorizado (AVX2).
                             if !is_duplicate
                                 && want_preview.load(Ordering::Relaxed)
                                 && !preview_tx.is_full()
                             {
-                                let mut rgba = vec![255u8; bgra.len()];
+                                let mut rgba = preview_recycle
+                                    .lock()
+                                    .take()
+                                    .unwrap_or_default();
+                                if rgba.len() != bgra.len() {
+                                    rgba.resize(bgra.len(), 255u8);
+                                }
                                 for (dst, src) in
                                     rgba.chunks_exact_mut(4).zip(bgra.chunks_exact(4))
                                 {
                                     dst[0] = src[2];
                                     dst[1] = src[1];
                                     dst[2] = src[0];
+                                    dst[3] = 255;
                                 }
                                 if preview_tx
                                     .try_send(DecodedVideoFrame {
@@ -513,6 +534,7 @@ impl ScreenShareApp {
 
     fn start_watching(&mut self, host_identity: String) {
         self.watching_identity = Some(host_identity.clone());
+        self.remote_video_slot.clear();
         self.video_texture = None;
         self.measured_fps = 0;
         self.want_self_preview_atomic.store(false, Ordering::Relaxed);
@@ -525,6 +547,7 @@ impl ScreenShareApp {
 
     fn stop_watching(&mut self) {
         self.watching_identity = None;
+        self.remote_video_slot.clear();
         self.video_texture = None;
         self.measured_fps = 0;
         self.fps_counter_frames = 0;
@@ -537,6 +560,9 @@ impl ScreenShareApp {
 
     fn process_events(&mut self, ctx: &Context) {
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if !is_minimized {
+            self.remote_video_slot.mark_ui_active();
+        }
 
         // Atualizar flag atômica de self-preview (desativa automaticamente quando minimizado para poupar CPU/RAM)
         let should_preview =
@@ -571,18 +597,10 @@ impl ScreenShareApp {
             }
         }
 
-        let mut latest_remote_video: Option<DecodedVideoFrame> = None;
-        let mut remote_frames_in_tick: u32 = 0;
         let mut incoming_events = Vec::new();
         if let Some(ref rx) = self.net_event_rx {
             while let Ok(ev) = rx.try_recv() {
-                match ev {
-                    NetworkEvent::RemoteVideoFrame(frame) => {
-                        remote_frames_in_tick += 1;
-                        latest_remote_video = Some(frame);
-                    }
-                    other => incoming_events.push(other),
-                }
+                incoming_events.push(ev);
             }
         }
 
@@ -614,7 +632,6 @@ impl ScreenShareApp {
                             .any(|p| p.identity == watched_id && p.is_streaming);
                         if !still_streaming {
                             self.stop_watching();
-                            latest_remote_video = None;
                             if self.is_fullscreen {
                                 self.is_fullscreen = false;
                                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
@@ -635,42 +652,61 @@ impl ScreenShareApp {
                     self.latency_ms = rtt;
                     self.latency_atomic.store(rtt as u32, Ordering::Relaxed);
                 }
-                NetworkEvent::RemoteAudioFrame { samples } => {
-                    if self.watching_identity.is_some() {
-                        if let Some(ref pcm_tx) = self.audio_pcm_tx {
-                            let _ = pcm_tx.try_send(samples);
-                        }
-                    }
-                }
-                NetworkEvent::RemoteVideoFrame(_) => {}
             }
         }
 
-        if let Some(frame) = latest_remote_video {
-            if self.watching_identity.as_deref() == Some(frame.sender.as_str()) {
-                self.upload_video_frame(ctx, frame, remote_frames_in_tick.max(1));
-            }
-        } else if self.watching_identity.is_none() && self.is_publishing && self.show_self_preview {
-            let mut latest_preview = None;
-            let mut preview_frames_in_tick: u32 = 0;
-            if let Some(ref rx) = self.local_preview_rx {
-                while let Ok(frame) = rx.try_recv() {
-                    preview_frames_in_tick += 1;
-                    latest_preview = Some(frame);
+        if !is_minimized {
+            if let Some((frame, count)) = self.remote_video_slot.take_latest() {
+                if self.watching_identity.as_deref() == Some(frame.sender.as_str()) {
+                    self.upload_video_frame(ctx, frame, count.max(1), true);
+                } else {
+                    self.remote_video_slot.recycle_buffer(frame.rgba);
                 }
-            }
-            if let Some(frame) = latest_preview {
-                self.upload_video_frame(ctx, frame, preview_frames_in_tick.max(1));
+            } else if self.watching_identity.is_none()
+                && self.is_publishing
+                && self.show_self_preview
+            {
+                let mut latest_preview: Option<DecodedVideoFrame> = None;
+                let mut preview_frames_in_tick: u32 = 0;
+                if let Some(ref rx) = self.local_preview_rx {
+                    while let Ok(frame) = rx.try_recv() {
+                        if let Some(old) = latest_preview.replace(frame) {
+                            *self.local_preview_recycle.lock() = Some(old.rgba);
+                        }
+                        preview_frames_in_tick += 1;
+                    }
+                }
+                if let Some(frame) = latest_preview {
+                    self.upload_video_frame(ctx, frame, preview_frames_in_tick.max(1), false);
+                }
             }
         }
     }
 
-    fn upload_video_frame(&mut self, ctx: &Context, frame: DecodedVideoFrame, count: u32) {
+    fn upload_video_frame(
+        &mut self,
+        ctx: &Context,
+        frame: DecodedVideoFrame,
+        count: u32,
+        is_remote: bool,
+    ) {
         let size = [frame.width as usize, frame.height as usize];
         if frame.rgba.len() < size[0] * size[1] * 4 {
+            if is_remote {
+                self.remote_video_slot.recycle_buffer(frame.rgba);
+            } else {
+                *self.local_preview_recycle.lock() = Some(frame.rgba);
+            }
             return;
         }
         let color_image = ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
+        // Devolve o Vec<u8> de 8.3 MB imediatamente ao pool de reciclagem (Zero Memory Leak / Zero Heap Churn!)
+        if is_remote {
+            self.remote_video_slot.recycle_buffer(frame.rgba);
+        } else {
+            *self.local_preview_recycle.lock() = Some(frame.rgba);
+        }
+
         let tex_options = TextureOptions::LINEAR;
 
         if let Some(ref mut tex) = self.video_texture {

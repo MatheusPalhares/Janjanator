@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -92,11 +93,15 @@ fn peek_binary_packet_sender(data: &[u8]) -> Option<&str> {
     std::str::from_utf8(&data[3..3 + sender_len]).ok()
 }
 
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
 struct ClientPeer {
+    conn_id: u64,
     info: ParticipantInfo,
     watching: Option<String>,
     ctrl_tx: Sender<Vec<u8>>,
     audio_tx: Sender<Vec<u8>>,
+    audio_rx: Receiver<Vec<u8>>,
     video_tx: Sender<Vec<u8>>,
     video_rx: Receiver<Vec<u8>>,
     last_congestion_notify: Instant,
@@ -113,7 +118,7 @@ fn broadcast_room_state(peers: &Arc<Mutex<HashMap<String, ClientPeer>>>) {
 }
 
 /// Envia uma mensagem WebSocket com controle estrito de `pending_flush` para impedir
-/// que o `write_buffer` interno do `tungstenite` acumule múltiplos frames em conexões ZeroTier.
+/// que o `write_buffer` interno do `tungstenite` acumule múltiplos frames em conexões ZeroTier/Cloudflare.
 fn send_ws_gated(
     socket: &mut WebSocket<TcpStream>,
     data: Vec<u8>,
@@ -122,6 +127,11 @@ fn send_ws_gated(
     match socket.send(Message::Binary(data)) {
         Ok(()) => {
             *pending_flush = false;
+            true
+        }
+        Err(tungstenite::Error::WriteBufferFull(_)) => {
+            *pending_flush = true;
+            let _ = socket.flush();
             true
         }
         Err(tungstenite::Error::Io(ref err))
@@ -208,12 +218,13 @@ fn handle_peer_connection(
 
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
     let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(96);
-    // Micro-buffer de 4 frames (~66ms) para absorver bursts de ACK do ZeroTier sem descartar deltas nem atrasar a live
+    // Micro-buffer de 4 frames (~66ms) para absorver bursts de ACK do ZeroTier/Cloudflare sem descartar deltas nem atrasar a live
     let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+    let my_conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
     let mut my_id: Option<String> = None;
     let mut pending_flush = false;
 
-    loop {
+    'conn_loop: loop {
         let mut active = false;
 
         // 1. Se o socket estava com flush pendente (WouldBlock), tentar descarregar antes de colocar mais dados no buffer do tungstenite
@@ -230,7 +241,7 @@ fn handle_peer_connection(
                 {
                     // Socket TCP ainda enviando o pacote anterior; não empilhar novos pacotes
                 }
-                Err(_) => break,
+                Err(_) => break 'conn_loop,
             }
         }
 
@@ -243,7 +254,7 @@ fn handle_peer_connection(
                 };
                 active = true;
                 if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
-                    return;
+                    break 'conn_loop;
                 }
             }
 
@@ -253,7 +264,7 @@ fn handle_peer_connection(
                 };
                 active = true;
                 if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
-                    return;
+                    break 'conn_loop;
                 }
             }
 
@@ -263,7 +274,7 @@ fn handle_peer_connection(
                 };
                 active = true;
                 if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
-                    return;
+                    break 'conn_loop;
                 }
             }
         }
@@ -284,6 +295,7 @@ fn handle_peer_connection(
                                     if peer.watching.as_deref() == Some(sender_id) {
                                         // Se a fila de áudio do espectador encher por pico extremo, descarta o mais antigo
                                         if peer.audio_tx.try_send(data.clone()).is_err() {
+                                            let _ = peer.audio_rx.try_recv();
                                             let _ = peer.audio_tx.try_send(data.clone());
                                         }
                                     }
@@ -300,7 +312,7 @@ fn handle_peer_connection(
                                     for peer in map.values_mut() {
                                         if peer.watching.as_deref() == Some(sender_id) {
                                             if peer.video_tx.try_send(data.clone()).is_err() {
-                                                // O link ZeroTier do espectador acumulou >4 frames:
+                                                // O link do espectador acumulou >4 frames:
                                                 // substitui o mais antigo pelo mais novo (Zero-Lag) e avisa o Host!
                                                 let _ = peer.video_rx.try_recv();
                                                 let _ = peer.video_tx.try_send(data.clone());
@@ -345,10 +357,12 @@ fn handle_peer_connection(
                                             map.insert(
                                                 id,
                                                 ClientPeer {
+                                                    conn_id: my_conn_id,
                                                     info: participant,
                                                     watching: prev_watching,
                                                     ctrl_tx: ctrl_tx.clone(),
                                                     audio_tx: audio_tx.clone(),
+                                                    audio_rx: audio_rx.clone(),
                                                     video_tx: video_tx.clone(),
                                                     video_rx: video_rx.clone(),
                                                     last_congestion_notify: Instant::now(),
@@ -421,12 +435,7 @@ fn handle_peer_connection(
                     }
                 }
                 Ok(Message::Close(_)) => {
-                    if let Some(id) = my_id.take() {
-                        println!("[LEAVE] Usuário '{}' desconectou.", id);
-                        peers_ref.lock().remove(&id);
-                        broadcast_room_state(&peers_ref);
-                    }
-                    return;
+                    break 'conn_loop;
                 }
                 Err(tungstenite::Error::Io(ref e))
                     if e.kind() == ErrorKind::WouldBlock
@@ -436,12 +445,7 @@ fn handle_peer_connection(
                     break;
                 }
                 Err(_) => {
-                    if let Some(id) = my_id.take() {
-                        println!("[LEAVE] Usuário '{}' desconectou.", id);
-                        peers_ref.lock().remove(&id);
-                        broadcast_room_state(&peers_ref);
-                    }
-                    return;
+                    break 'conn_loop;
                 }
                 _ => {}
             }
@@ -449,6 +453,24 @@ fn handle_peer_connection(
 
         if !active {
             thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    // Limpeza garantida ao encerrar a conexão por qualquer motivo (erro de flush, escrita, close ou leitura).
+    // Checa `conn_id` para não apagar uma reconexão mais recente do mesmo usuário!
+    if let Some(id) = my_id.take() {
+        let removed = {
+            let mut map = peers_ref.lock();
+            if map.get(&id).map(|p| p.conn_id) == Some(my_conn_id) {
+                map.remove(&id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            println!("[LEAVE] Usuário '{}' desconectou.", id);
+            broadcast_room_state(&peers_ref);
         }
     }
 }

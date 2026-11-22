@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -166,13 +166,98 @@ pub enum NetworkEvent {
     Reconnecting(String),
     Disconnected(String),
     ParticipantsUpdated(Vec<ParticipantInfo>),
-    RemoteVideoFrame(DecodedVideoFrame),
-    RemoteAudioFrame {
-        samples: Vec<i16>,
-    },
     KeyframeRequested,
     ViewerCongested,
     LatencyUpdatedMs(u64),
+}
+
+fn current_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+struct RemoteVideoSlotInner {
+    latest_frame: Option<DecodedVideoFrame>,
+    recycle_buf: Option<Vec<u8>>,
+    accumulated_frames: u32,
+}
+
+/// Slot de frame único com reciclagem de buffer (Ping-Pong Zero-Allocation).
+/// Garante uso de memória constante O(1) (~16 MB máx) mesmo após horas de live ou com janela minimizada/em segundo plano.
+pub struct RemoteVideoSlot {
+    inner: Mutex<RemoteVideoSlotInner>,
+    last_ui_active_ms: AtomicU64,
+}
+
+impl RemoteVideoSlot {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(RemoteVideoSlotInner {
+                latest_frame: None,
+                recycle_buf: None,
+                accumulated_frames: 0,
+            }),
+            last_ui_active_ms: AtomicU64::new(current_epoch_ms()),
+        }
+    }
+
+    pub fn mark_ui_active(&self) {
+        self.last_ui_active_ms
+            .store(current_epoch_ms(), Ordering::Relaxed);
+    }
+
+    pub fn is_ui_active(&self) -> bool {
+        let last = self.last_ui_active_ms.load(Ordering::Relaxed);
+        current_epoch_ms().saturating_sub(last) <= 400
+    }
+
+    pub fn store_from_decoder(
+        &self,
+        decoder: &VideoStreamDecoder,
+        sender: String,
+        hw_encoder_name: String,
+        frames_count: u32,
+    ) {
+        let mut guard = self.inner.lock();
+        // Se a UI ainda não consumiu o frame anterior, reaproveita o próprio Vec<u8> dele (0 alocação!)
+        let reused_buf = if let Some(prev) = guard.latest_frame.take() {
+            prev.rgba
+        } else if let Some(recycled) = guard.recycle_buf.take() {
+            recycled
+        } else {
+            Vec::new()
+        };
+        let frame = decoder.export_into_buffer(sender, hw_encoder_name, reused_buf);
+        guard.latest_frame = Some(frame);
+        guard.accumulated_frames = guard.accumulated_frames.saturating_add(frames_count.max(1));
+    }
+
+    pub fn take_latest(&self) -> Option<(DecodedVideoFrame, u32)> {
+        let mut guard = self.inner.lock();
+        let frame = guard.latest_frame.take()?;
+        let count = guard.accumulated_frames.max(1);
+        guard.accumulated_frames = 0;
+        Some((frame, count))
+    }
+
+    pub fn recycle_buffer(&self, buf: Vec<u8>) {
+        let mut guard = self.inner.lock();
+        if guard.recycle_buf.is_none() {
+            guard.recycle_buf = Some(buf);
+        }
+    }
+
+    pub fn clear(&self) {
+        let mut guard = self.inner.lock();
+        if let Some(prev) = guard.latest_frame.take() {
+            if guard.recycle_buf.is_none() {
+                guard.recycle_buf = Some(prev.rgba);
+            }
+        }
+        guard.accumulated_frames = 0;
+    }
 }
 
 pub enum OutgoingCommand {
@@ -240,6 +325,7 @@ impl RoomNetworkClient {
         local_participant: ParticipantInfo,
         event_tx: Sender<NetworkEvent>,
         audio_pcm_tx: Sender<Vec<i16>>,
+        video_slot: Arc<RemoteVideoSlot>,
         ui_ctx: eframe::egui::Context,
     ) -> Self {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<OutgoingCommand>(32);
@@ -268,6 +354,7 @@ impl RoomNetworkClient {
                         socket_busy_clone,
                         event_tx,
                         audio_pcm_tx,
+                        video_slot,
                         stop_clone,
                         ui_ctx,
                     );
@@ -281,7 +368,7 @@ impl RoomNetworkClient {
                         "Panic não identificado na thread de rede".to_string()
                     };
                     eprintln!("[Network Worker Panic] {}", err_msg);
-                    let _ = event_tx_panic.send(NetworkEvent::Disconnected(format!(
+                    let _ = event_tx_panic.try_send(NetworkEvent::Disconnected(format!(
                         "Erro interno ao conectar: {}",
                         err_msg
                     )));
@@ -413,6 +500,7 @@ fn run_network_worker(
     socket_busy: Arc<AtomicBool>,
     event_tx: Sender<NetworkEvent>,
     audio_pcm_tx: Sender<Vec<i16>>,
+    video_slot: Arc<RemoteVideoSlot>,
     stop_flag: Arc<AtomicBool>,
     ui_ctx: eframe::egui::Context,
 ) {
@@ -438,47 +526,74 @@ fn run_network_worker(
     let watched_host_shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let watched_for_vdec = watched_host_shared.clone();
 
-    // Iniciar thread dedicada de decodificação de vídeo para NUNCA bloquear o socket TCP
-    let (vdec_tx, vdec_rx) = crossbeam_channel::bounded::<EncodedVideoPacket>(32);
-    let event_tx_vdec = event_tx.clone();
+    // Iniciar thread dedicada de decodificação de vídeo In-Place com reciclagem de buffer (Zero Memory Leak!)
+    let (vdec_tx, vdec_rx) = crossbeam_channel::bounded::<EncodedVideoPacket>(24);
+    let vdec_rx_overflow = vdec_rx.clone();
     let stop_vdec = stop_flag.clone();
     let ui_ctx_vdec = ui_ctx.clone();
+    let video_slot_vdec = video_slot.clone();
     thread::Builder::new()
         .name("video-decoder-worker".to_string())
         .spawn(move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 let mut decoder = VideoStreamDecoder::new();
+                let mut batch: Vec<EncodedVideoPacket> = Vec::with_capacity(24);
                 while !stop_vdec.load(Ordering::Relaxed) {
-                    let Ok(mut pkt) = vdec_rx.recv_timeout(Duration::from_millis(50)) else {
+                    let Ok(first_pkt) = vdec_rx.recv_timeout(Duration::from_millis(50)) else {
                         continue;
                     };
-                    if watched_for_vdec.lock().as_deref() != Some(pkt.sender.as_str()) {
+                    let current_watched = watched_for_vdec.lock().clone();
+                    let Some(ref target_sender) = current_watched else {
+                        while vdec_rx.try_recv().is_ok() {}
+                        continue;
+                    };
+
+                    batch.clear();
+                    if &first_pkt.sender == target_sender {
+                        batch.push(first_pkt);
+                    }
+                    // Se houver mais pacotes acumulados por rajada de TCP/Cloudflare, coalescer no mesmo ciclo
+                    // aplicando todos os deltas in-place no canvas sem clonar 8.3 MB para frames intermediários!
+                    while let Ok(next_pkt) = vdec_rx.try_recv() {
+                        if &next_pkt.sender == target_sender {
+                            batch.push(next_pkt);
+                        }
+                    }
+                    if batch.is_empty() {
                         continue;
                     }
-                    // Só fundir frames intermediários se houver atraso real acumulado (>3 frames na fila);
-                    // em rajadas normais de 2 pacotes do TCP/ZeroTier, emite cada frame individualmente para manter 60 FPS!
-                    while vdec_rx.len() > 3 {
-                        let Ok(next_pkt) = vdec_rx.try_recv() else {
-                            break;
-                        };
-                        if watched_for_vdec.lock().as_deref() != Some(next_pkt.sender.as_str()) {
-                            continue;
-                        }
-                        if next_pkt.is_keyframe {
-                            pkt = next_pkt;
-                        } else {
-                            let _ = decoder.decode_packet(&pkt);
-                            pkt = next_pkt;
+
+                    // Se houver um Keyframe completo dentro da rajada, descartar todos os deltas anteriores a ele!
+                    let start_idx = batch
+                        .iter()
+                        .rposition(|p| p.is_keyframe)
+                        .unwrap_or(0);
+
+                    let total_in_batch = batch.len() as u32;
+                    let mut any_applied = false;
+                    let mut last_sender = String::new();
+                    let mut last_hw_enc = String::new();
+
+                    for pkt in &batch[start_idx..] {
+                        if decoder.apply_packet(pkt) {
+                            any_applied = true;
+                            last_sender = pkt.sender.clone();
+                            last_hw_enc = pkt.hw_encoder_name.clone();
                         }
                     }
-                    if watched_for_vdec.lock().as_deref() == Some(pkt.sender.as_str()) {
-                        if let Some(frame) = decoder.decode_packet(&pkt) {
-                            if event_tx_vdec
-                                .try_send(NetworkEvent::RemoteVideoFrame(frame))
-                                .is_ok()
-                            {
-                                ui_ctx_vdec.request_repaint();
-                            }
+
+                    if any_applied
+                        && watched_for_vdec.lock().as_deref() == Some(last_sender.as_str())
+                    {
+                        video_slot_vdec.store_from_decoder(
+                            &decoder,
+                            last_sender,
+                            last_hw_enc,
+                            total_in_batch,
+                        );
+                        // Só acorda a thread da GUI se a janela estiver ativa/visível (evita loop de eventos quando minimizado!)
+                        if video_slot_vdec.is_ui_active() {
+                            ui_ctx_vdec.request_repaint();
                         }
                     }
                 }
@@ -507,14 +622,14 @@ fn run_network_worker(
             Ok(s) => s,
             Err(err_msg) => {
                 if first_connect {
-                    let _ = event_tx.send(NetworkEvent::Disconnected(format!(
+                    let _ = event_tx.try_send(NetworkEvent::Disconnected(format!(
                         "Erro ao conectar em {}:{}: {}",
                         host, port, err_msg
                     )));
                     ui_ctx.request_repaint();
                     return;
                 } else {
-                    let _ = event_tx.send(NetworkEvent::Reconnecting(format!(
+                    let _ = event_tx.try_send(NetworkEvent::Reconnecting(format!(
                         "Reconectando a {}:{}... ({})",
                         host, port, err_msg
                     )));
@@ -550,7 +665,7 @@ fn run_network_worker(
 
         if first_connect {
             first_connect = false;
-            let _ = event_tx.send(NetworkEvent::Connected {
+            let _ = event_tx.try_send(NetworkEvent::Connected {
                 server_endpoint: format!("{}:{}", host, port),
                 jwt_token: jwt_token.clone(),
                 livekit_reachable,
@@ -707,7 +822,10 @@ fn run_network_worker(
                             WIRE_TAG_VIDEO_BINARY => {
                                 if let Some(pkt) = EncodedVideoPacket::from_wire_bytes(&data) {
                                     if watched_host.as_deref() == Some(pkt.sender.as_str()) {
-                                        let _ = vdec_tx.try_send(pkt);
+                                        if vdec_tx.try_send(pkt.clone()).is_err() {
+                                            let _ = vdec_rx_overflow.try_recv();
+                                            let _ = vdec_tx.try_send(pkt);
+                                        }
                                     }
                                 }
                             }
@@ -725,7 +843,7 @@ fn run_network_worker(
                                 if let Some(msg) = SfuControlMessage::from_wire_bytes(&data) {
                                     match msg {
                                         SfuControlMessage::RoomState { participants } => {
-                                            let _ = event_tx.send(
+                                            let _ = event_tx.try_send(
                                                 NetworkEvent::ParticipantsUpdated(participants),
                                             );
                                             ui_ctx.request_repaint();
@@ -734,16 +852,16 @@ fn run_network_worker(
                                             target_host_identity,
                                         } => {
                                             if target_host_identity == my_identity {
-                                                let _ =
-                                                    event_tx.send(NetworkEvent::KeyframeRequested);
+                                                let _ = event_tx
+                                                    .try_send(NetworkEvent::KeyframeRequested);
                                             }
                                         }
                                         SfuControlMessage::ViewerCongested {
                                             target_host_identity,
                                         } => {
                                             if target_host_identity == my_identity {
-                                                let _ =
-                                                    event_tx.send(NetworkEvent::ViewerCongested);
+                                                let _ = event_tx
+                                                    .try_send(NetworkEvent::ViewerCongested);
                                             }
                                         }
                                         SfuControlMessage::Pong(sent_ms) => {
@@ -753,8 +871,8 @@ fn run_network_worker(
                                                 .as_millis()
                                                 as u64;
                                             let rtt = now_ms.saturating_sub(sent_ms);
-                                            let _ =
-                                                event_tx.send(NetworkEvent::LatencyUpdatedMs(rtt));
+                                            let _ = event_tx
+                                                .try_send(NetworkEvent::LatencyUpdatedMs(rtt));
                                         }
                                         _ => {}
                                     }
@@ -800,6 +918,11 @@ fn send_ws_client_gated(
             *pending_flush = false;
             true
         }
+        Err(tungstenite::Error::WriteBufferFull(_)) => {
+            *pending_flush = true;
+            let _ = socket.flush();
+            true
+        }
         Err(tungstenite::Error::Io(ref err))
             if err.kind() == ErrorKind::WouldBlock
                 || err.kind() == ErrorKind::TimedOut
@@ -821,6 +944,11 @@ fn send_ws_gated(
     match socket.send(Message::Binary(data)) {
         Ok(()) => {
             *pending_flush = false;
+            true
+        }
+        Err(tungstenite::Error::WriteBufferFull(_)) => {
+            *pending_flush = true;
+            let _ = socket.flush();
             true
         }
         Err(tungstenite::Error::Io(ref err))
@@ -860,11 +988,15 @@ fn connect_ws_nonblocking(ws_url: &str) -> Result<WebSocket<MaybeTlsStream<TcpSt
     Ok(socket)
 }
 
+static NEXT_EMBEDDED_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
 struct ClientPeer {
+    conn_id: u64,
     info: ParticipantInfo,
     watching: Option<String>,
     ctrl_tx: Sender<Vec<u8>>,
     audio_tx: Sender<Vec<u8>>,
+    audio_rx: Receiver<Vec<u8>>,
     video_tx: Sender<Vec<u8>>,
     video_rx: Receiver<Vec<u8>>,
     last_congestion_notify: Instant,
@@ -924,10 +1056,11 @@ fn handle_embedded_peer(
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
     let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<u8>>(96);
     let (video_tx, video_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+    let my_conn_id = NEXT_EMBEDDED_CONN_ID.fetch_add(1, Ordering::Relaxed);
     let mut my_id: Option<String> = None;
     let mut pending_flush = false;
 
-    loop {
+    'conn_loop: loop {
         let mut active = false;
 
         if pending_flush {
@@ -940,7 +1073,7 @@ fn handle_embedded_peer(
                     if err.kind() == ErrorKind::WouldBlock
                         || err.kind() == ErrorKind::TimedOut
                         || err.kind() == ErrorKind::Interrupted => {}
-                Err(_) => break,
+                Err(_) => break 'conn_loop,
             }
         }
 
@@ -951,7 +1084,7 @@ fn handle_embedded_peer(
                 };
                 active = true;
                 if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
-                    return;
+                    break 'conn_loop;
                 }
             }
 
@@ -961,7 +1094,7 @@ fn handle_embedded_peer(
                 };
                 active = true;
                 if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
-                    return;
+                    break 'conn_loop;
                 }
             }
 
@@ -971,7 +1104,7 @@ fn handle_embedded_peer(
                 };
                 active = true;
                 if !send_ws_gated(&mut ws, bin, &mut pending_flush) {
-                    return;
+                    break 'conn_loop;
                 }
             }
         }
@@ -989,7 +1122,10 @@ fn handle_embedded_peer(
                                 let map = peers_ref.lock();
                                 for peer in map.values() {
                                     if peer.watching.as_deref() == Some(sender_id) {
-                                        let _ = peer.audio_tx.try_send(data.clone());
+                                        if peer.audio_tx.try_send(data.clone()).is_err() {
+                                            let _ = peer.audio_rx.try_recv();
+                                            let _ = peer.audio_tx.try_send(data.clone());
+                                        }
                                     }
                                 }
                             }
@@ -1043,10 +1179,12 @@ fn handle_embedded_peer(
                                             map.insert(
                                                 id,
                                                 ClientPeer {
+                                                    conn_id: my_conn_id,
                                                     info: participant,
                                                     watching: prev_watching,
                                                     ctrl_tx: ctrl_tx.clone(),
                                                     audio_tx: audio_tx.clone(),
+                                                    audio_rx: audio_rx.clone(),
                                                     video_tx: video_tx.clone(),
                                                     video_rx: video_rx.clone(),
                                                     last_congestion_notify: Instant::now(),
@@ -1119,11 +1257,7 @@ fn handle_embedded_peer(
                     }
                 }
                 Ok(Message::Close(_)) => {
-                    if let Some(id) = my_id.take() {
-                        peers_ref.lock().remove(&id);
-                        broadcast_room_state(&peers_ref);
-                    }
-                    return;
+                    break 'conn_loop;
                 }
                 Err(tungstenite::Error::Io(ref e))
                     if e.kind() == ErrorKind::WouldBlock
@@ -1133,11 +1267,7 @@ fn handle_embedded_peer(
                     break;
                 }
                 Err(_) => {
-                    if let Some(id) = my_id.take() {
-                        peers_ref.lock().remove(&id);
-                        broadcast_room_state(&peers_ref);
-                    }
-                    return;
+                    break 'conn_loop;
                 }
                 _ => {}
             }
@@ -1145,6 +1275,22 @@ fn handle_embedded_peer(
 
         if !active {
             thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    // Limpeza garantida ao sair do loop por qualquer motivo (flush erro, close ou read erro)
+    if let Some(id) = my_id.take() {
+        let removed = {
+            let mut map = peers_ref.lock();
+            if map.get(&id).map(|p| p.conn_id) == Some(my_conn_id) {
+                map.remove(&id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            broadcast_room_state(&peers_ref);
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -26,7 +26,8 @@ use windows::Win32::{
 const NUM_PARALLEL_BANDS: usize = 15;
 
 /// Faixa de qualidade JPEG do controle adaptativo para conteúdo em movimento (equilíbrio ideal 60 FPS).
-const ADAPTIVE_MIN_QUALITY: u8 = 72;
+/// Permite descer até 62 apenas sob congestionamento severo com múltiplos espectadores no túnel Cloudflare.
+const ADAPTIVE_MIN_QUALITY: u8 = 62;
 const ADAPTIVE_MAX_QUALITY: u8 = 82;
 
 /// Refinamento progressivo de regiões estáticas (técnica usada por RDP/VNC/Parsec):
@@ -144,6 +145,8 @@ pub struct LowLatencyVideoEncoder {
     /// Bytes de conteúdo em movimento (exclui refinamentos) usados pelo controle adaptativo.
     controller_bytes_in_window: u64,
     controller_kbps: u32,
+    /// Cooldown após sinal de congestionamento para pausar refinamentos Q=86 enquanto o túnel estabiliza.
+    congestion_cooldown_frames: u16,
 }
 
 impl LowLatencyVideoEncoder {
@@ -175,6 +178,7 @@ impl LowLatencyVideoEncoder {
             band_refined: Vec::new(),
             controller_bytes_in_window: 0,
             controller_kbps: 0,
+            congestion_cooldown_frames: 0,
         }
     }
 
@@ -182,7 +186,7 @@ impl LowLatencyVideoEncoder {
         &self.hw_encoder_name
     }
 
-    /// Ajusta dinamicamente a qualidade com zona morta (deadband) entre 10 e 16 Mbps para evitar efeito sanfona/picos de 50+ Mbps.
+    /// Ajusta dinamicamente a qualidade com zona morta (deadband) para evitar saturar túneis Cloudflare com múltiplos espectadores.
     pub fn notify_network_pressure(&mut self, queue_len: usize, rtt_ms: u64) {
         let _ = self.bitrate_preset;
         let min_q: u8 = ADAPTIVE_MIN_QUALITY;
@@ -192,22 +196,26 @@ impl LowLatencyVideoEncoder {
         if congested_remote {
             self.adaptive_quality = self.adaptive_quality.saturating_sub(3).max(min_q);
             self.stable_frames_count = 0;
-            // Agenda 15 frames de rolling refresh para curar qualquer delta descartado no SFU
-            self.healing_frames_remaining = NUM_PARALLEL_BANDS as u8;
+            self.congestion_cooldown_frames = 45;
+            // Só agenda rolling refresh se já não estiver no meio de um ciclo de cura (evita loop infinito de pacotes!)
+            if self.healing_frames_remaining == 0 {
+                self.healing_frames_remaining = NUM_PARALLEL_BANDS as u8;
+            }
             return;
         }
 
         if queue_len > 2 || rtt_ms > 180 {
             self.adaptive_quality = self.adaptive_quality.saturating_sub(2).max(min_q);
             self.stable_frames_count = 0;
+            self.congestion_cooldown_frames = 30;
         } else if rtt_ms > 120 {
-            self.adaptive_quality = self.adaptive_quality.saturating_sub(1).max(min_q + 2);
+            self.adaptive_quality = self.adaptive_quality.saturating_sub(1).max(min_q + 4);
             self.stable_frames_count = 0;
         } else {
             // Usa apenas o bitrate de conteúdo em movimento (refinamentos estáticos são picos pontuais)
             let live_kbps = self.controller_kbps;
-            // Só sobe qualidade se o bitrate atual estiver abaixo de 11 Mbps (impede subir para Q=88 e explodir para 50~80 Mbps!)
-            if live_kbps < 11_000 {
+            // Só sobe qualidade se o bitrate atual estiver abaixo de 9.5 Mbps (mantém folga para 3+ espectadores simultâneos no túnel!)
+            if live_kbps < 9_500 && self.congestion_cooldown_frames == 0 {
                 self.stable_frames_count += 1;
                 if self.stable_frames_count >= 30 {
                     self.stable_frames_count = 0;
@@ -261,18 +269,13 @@ impl LowLatencyVideoEncoder {
             self.band_refined.iter_mut().for_each(|r| *r = false);
         }
 
-        // Rolling refresh inteligente: ativo durante auto-cura pós-congestionamento ou em faixas ainda não refinadas
+        self.congestion_cooldown_frames = self.congestion_cooldown_frames.saturating_sub(1);
+
+        // Rolling refresh inteligente: ativo apenas durante auto-cura pós-congestionamento
         let healing_active = self.healing_frames_remaining > 0;
         let active_rolling_band = if self.healing_frames_remaining > 0 {
             self.healing_frames_remaining -= 1;
             Some((self.sequence as usize) % num_bands)
-        } else if self.sequence % 8 == 0 {
-            let candidate = ((self.sequence / 8) as usize) % num_bands;
-            if !self.band_refined[candidate] {
-                Some(candidate)
-            } else {
-                None
-            }
         } else {
             None
         };
@@ -280,6 +283,7 @@ impl LowLatencyVideoEncoder {
         // Escolhe 1 faixa estática ainda não refinada para reenviar em alta qualidade (rotacionando o ponto de partida)
         let refine_band: Option<usize> = if !is_keyframe
             && !healing_active
+            && self.congestion_cooldown_frames == 0
             && self.sequence % REFINE_EVERY_N_FRAMES == 0
         {
             let start = (self.sequence as usize / REFINE_EVERY_N_FRAMES as usize) % num_bands;
@@ -318,8 +322,8 @@ impl LowLatencyVideoEncoder {
             let src_slice = &bgra[(y_start * stride)..(y_end * stride)];
             let is_refine = refine_band == Some(b);
             let force_encode = is_keyframe || is_refine || active_rolling_band == Some(b);
-            // Rolling refresh de uma faixa já refinada mantém a qualidade alta (não degrada texto parado)
-            let band_quality = if is_refine || (!is_keyframe && self.band_refined[b]) {
+            // Usa REFINE_QUALITY apenas no passo explícito de refinamento (nunca durante auto-cura de congestionamento!)
+            let band_quality = if is_refine {
                 REFINE_QUALITY
             } else {
                 quality
@@ -474,13 +478,13 @@ impl LowLatencyVideoEncoder {
             self.controller_bytes_in_window = 0;
             self.window_start = Instant::now();
 
-            // Teto de banda considera apenas conteúdo em movimento (refinamento é pontual e se auto-limita)
-            if motion_kbps > 16_000 {
+            // Teto de banda considera conteúdo em movimento com margem para múltiplos espectadores no túnel Cloudflare
+            if motion_kbps > 13_000 {
                 self.adaptive_quality = self
                     .adaptive_quality
                     .saturating_sub(2)
                     .max(ADAPTIVE_MIN_QUALITY);
-            } else if motion_kbps > 13_500 {
+            } else if motion_kbps > 10_500 {
                 self.adaptive_quality = self
                     .adaptive_quality
                     .saturating_sub(1)
@@ -506,7 +510,7 @@ impl LowLatencyVideoEncoder {
     }
 }
 
-/// Decodificador de Vídeo Multi-Core com estado para recompor faixas Delta em < 1.2ms.
+/// Decodificador de Vídeo Multi-Core In-Place (Zero alocações intermediárias por faixa e Zero clones descartados).
 pub struct VideoStreamDecoder {
     canvas_rgba: Vec<u8>,
     canvas_w: u32,
@@ -522,81 +526,129 @@ impl VideoStreamDecoder {
         }
     }
 
-    pub fn decode_packet(&mut self, packet: &EncodedVideoPacket) -> Option<DecodedVideoFrame> {
+    /// Decodifica todas as faixas JPEG do pacote diretamente dentro de `self.canvas_rgba` em paralelo (Zero-Allocation).
+    /// Retorna `true` se ao menos uma faixa válida foi aplicada ao canvas.
+    pub fn apply_packet(&mut self, packet: &EncodedVideoPacket) -> bool {
         let data = &packet.payload;
         if data.is_empty() {
-            return None;
+            return false;
         }
         let mut cur = Cursor::new(data);
-        let band_count = cur.read_u8().ok()? as usize;
+        let Ok(band_count_u8) = cur.read_u8() else {
+            return false;
+        };
+        let band_count = band_count_u8 as usize;
         if band_count == 0 {
-            return None;
+            return false;
         }
 
         let width = packet.width;
         let height = packet.height;
         let total_rgba = (width as usize) * (height as usize) * 4;
+        if total_rgba == 0 {
+            return false;
+        }
 
         if self.canvas_w != width || self.canvas_h != height || self.canvas_rgba.len() != total_rgba
         {
             self.canvas_w = width;
             self.canvas_h = height;
-            self.canvas_rgba = vec![255u8; total_rgba];
+            self.canvas_rgba.resize(total_rgba, 255u8);
         }
 
         let mut band_tasks: Vec<(u32, u32, &[u8])> = Vec::with_capacity(band_count);
         for _ in 0..band_count {
-            let _band_idx = cur.read_u8().ok()?;
-            let y_start = cur.read_u32::<LittleEndian>().ok()?;
-            let band_h = cur.read_u32::<LittleEndian>().ok()?;
-            let jpeg_len = cur.read_u32::<LittleEndian>().ok()? as usize;
+            let Ok(_band_idx) = cur.read_u8() else {
+                return false;
+            };
+            let Ok(y_start) = cur.read_u32::<LittleEndian>() else {
+                return false;
+            };
+            let Ok(band_h) = cur.read_u32::<LittleEndian>() else {
+                return false;
+            };
+            let Ok(jpeg_len_u32) = cur.read_u32::<LittleEndian>() else {
+                return false;
+            };
+            let jpeg_len = jpeg_len_u32 as usize;
             let pos = cur.position() as usize;
             if pos + jpeg_len > data.len() {
-                return None;
+                return false;
             }
             band_tasks.push((y_start, band_h, &data[pos..pos + jpeg_len]));
             cur.set_position((pos + jpeg_len) as u64);
         }
 
-        // Decodificar todas as faixas em paralelo via Rayon (Zero-Copy slice input)
-        let decoded_strips: Vec<(u32, u32, Vec<u8>)> = band_tasks
-            .into_par_iter()
-            .filter_map(|(y_start, band_h, jpeg_slice)| {
-                let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(jpeg_slice));
-                let rgb = decoder.decode().ok()?;
-                let pixel_count = (width as usize) * (band_h as usize);
-                if rgb.len() < pixel_count * 3 {
-                    return None;
-                }
-                let mut rgba = vec![255u8; pixel_count * 4];
-                for (dst, src) in rgba
-                    .chunks_exact_mut(4)
-                    .zip(rgb[..pixel_count * 3].chunks_exact(3))
-                {
-                    dst[0] = src[0];
-                    dst[1] = src[1];
-                    dst[2] = src[2];
-                }
-                Some((y_start, band_h, rgba))
-            })
-            .collect();
+        band_tasks.sort_unstable_by_key(|&(y_start, _, _)| y_start);
 
         let stride = (width as usize) * 4;
-        for (y_start, band_h, strip_rgba) in decoded_strips {
+        let mut slice_tasks: Vec<(&[u8], &mut [u8], usize)> = Vec::with_capacity(band_tasks.len());
+        let mut rem_canvas: &mut [u8] = &mut self.canvas_rgba[..];
+        let mut current_byte_offset: usize = 0;
+
+        for (y_start, band_h, jpeg_slice) in band_tasks {
             let start_byte = (y_start as usize) * stride;
-            let end_byte = start_byte + (band_h as usize) * stride;
-            if end_byte <= self.canvas_rgba.len() && strip_rgba.len() == end_byte - start_byte {
-                self.canvas_rgba[start_byte..end_byte].copy_from_slice(&strip_rgba);
+            let band_bytes = (band_h as usize) * stride;
+            if start_byte < current_byte_offset
+                || band_bytes == 0
+                || start_byte + band_bytes > total_rgba
+            {
+                continue;
             }
+            let skip = start_byte - current_byte_offset;
+            let (_, after_skip) = rem_canvas.split_at_mut(skip);
+            let (band_canvas, rest) = after_skip.split_at_mut(band_bytes);
+            rem_canvas = rest;
+            current_byte_offset = start_byte + band_bytes;
+            let pixel_count = (width as usize) * (band_h as usize);
+            slice_tasks.push((jpeg_slice, band_canvas, pixel_count));
         }
 
-        Some(DecodedVideoFrame {
-            sender: packet.sender.clone(),
-            width,
-            height,
-            hw_encoder_name: packet.hw_encoder_name.clone(),
-            rgba: self.canvas_rgba.clone(),
-        })
+        if slice_tasks.is_empty() {
+            return false;
+        }
+
+        // Decodificar todas as faixas em paralelo escrevendo direto nas fatias de `self.canvas_rgba` (Zero strip_rgba alloc!)
+        slice_tasks
+            .into_par_iter()
+            .for_each(|(jpeg_slice, dst_rgba, pixel_count)| {
+                let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(jpeg_slice));
+                if let Ok(rgb) = decoder.decode() {
+                    if rgb.len() >= pixel_count * 3 && dst_rgba.len() == pixel_count * 4 {
+                        for (dst, src) in dst_rgba
+                            .chunks_exact_mut(4)
+                            .zip(rgb[..pixel_count * 3].chunks_exact(3))
+                        {
+                            dst[0] = src[0];
+                            dst[1] = src[1];
+                            dst[2] = src[2];
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            });
+
+        true
+    }
+
+    /// Exporta o canvas atual reutilizando o buffer `reused_buf` (0 alocações de heap após o 1º frame!).
+    pub fn export_into_buffer(
+        &self,
+        sender: String,
+        hw_encoder_name: String,
+        mut reused_buf: Vec<u8>,
+    ) -> DecodedVideoFrame {
+        if reused_buf.len() != self.canvas_rgba.len() {
+            reused_buf.resize(self.canvas_rgba.len(), 255u8);
+        }
+        reused_buf.copy_from_slice(&self.canvas_rgba);
+        DecodedVideoFrame {
+            sender,
+            width: self.canvas_w,
+            height: self.canvas_h,
+            hw_encoder_name,
+            rgba: reused_buf,
+        }
     }
 }
 
